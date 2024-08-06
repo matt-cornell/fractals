@@ -30,48 +30,51 @@ fn lerp(a: u32, b: u32, p: f64) -> u32 {
     ])
 }
 
-fn make_palette(colors: &[u32], size: usize) -> Vec<u32> {
-    let mut out = vec![0; size];
-    let lcm = num_integer::lcm(colors.len() - 1, size);
-    let cs = lcm / (colors.len() - 1);
-    let os = lcm / size;
-    for (i, c) in out.iter_mut().enumerate() {
-        let exp = i * os;
-        let (div, rem) = num_integer::div_rem(exp, cs);
-        if rem == 0 || div == colors.len() {
-            *c = colors[div];
-        } else {
-            *c = lerp(colors[div], colors[div + 1], (rem as f64) / (cs as f64));
+fn sample_palette(colors: &[u32], pos: f64) -> u32 {
+    match colors {
+        [] => panic!(),
+        &[c] => c,
+        &[a, b] => lerp(a, b, pos),
+        _ => {
+            let frac = (colors.len() as f64).recip();
+            let base = pos / frac;
+            let rem = base.fract() * (colors.len() as f64);
+            let base = base as usize;
+            if rem == 0.0 {
+                colors[base]
+            } else {
+                lerp(colors[base], colors[base + 1], rem)
+            }
         }
     }
-    out
 }
 
-fn julia_depth(mut z: Complex64, c: Complex64, depth: usize) -> usize {
+fn julia_depth(mut z: Complex64, c: Complex64, depth: usize) -> (usize, Complex64) {
     for i in 0..depth {
         if z.abs() > 2.0 {
-            return i;
+            return (i, z);
         }
         z = z * z + c;
     }
-    depth
+    (depth, z)
 }
 
 fn main() {
-    const UPPER_PALETTE: &[u32] = &[0x9c59d1ff, 0xfcf434ff];
-    const LOWER_PALETTE: &[u32] = &[0x2c2c2cff, 0xffffffff];
     let cli = Cli::parse();
     let mut canvas = tiny_skia::Pixmap::new(cli.res, cli.res).unwrap();
-    let upper = make_palette(UPPER_PALETTE, cli.depth + 1);
-    let lower = make_palette(LOWER_PALETTE, cli.depth + 1);
     let scale = 4.0 / (cli.res as f64);
     for (i, px) in canvas.pixels_mut().iter_mut().enumerate() {
         let (y, x) = num_integer::div_rem(i, cli.res as usize);
         let x = x as f64 * scale - 2.0;
         let y = y as f64 * scale - 2.0;
         let z = Complex64::new(x, y);
-        let depth = julia_depth(z, cli.c, cli.depth);
-        let color = lerp(upper[depth], lower[depth], y / 4.0 + 0.5);
+        let (depth, z) = julia_depth(z, cli.c, cli.depth);
+        let renormed = ((depth + 1) as f64
+            - z.abs().max(1.0).ln().max(1.0).ln() / std::f64::consts::LN_2)
+            / cli.depth as f64;
+        let upper = sample_palette(&[0x9c59d1ff, 0xfcf434ff], renormed);
+        let lower = sample_palette(&[0x2c2c2cff, 0xffffffff], renormed);
+        let color = lerp(upper, lower, y / 4.0 + 0.5);
         *px = make_color(color).premultiply();
     }
     canvas.save_png(cli.output).unwrap();
