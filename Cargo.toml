@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.5.4", features = ["derive"] }
+eframe = "0.30.0"
 num-complex = "0.4.6"
 num-integer = "0.1.46"
-tiny-skia = "0.11.4"
+png = "0.17.16"
