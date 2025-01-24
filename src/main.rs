@@ -6,6 +6,10 @@ use tiny_skia::*;
 #[derive(Parser)]
 struct Cli {
     c: Complex64,
+    #[arg(short, long, default_value_t = 2.0)]
+    exponent: f64,
+    #[arg(short = 'P', long, default_value_t = Complex64::ZERO)]
+    phoenix: Complex64,
     #[arg(short, long)]
     output: PathBuf,
     #[arg(short, long)]
@@ -49,12 +53,15 @@ fn sample_palette(colors: &[u32], pos: f64) -> u32 {
     }
 }
 
-fn julia_depth(mut z: Complex64, c: Complex64, depth: usize) -> (usize, Complex64) {
+fn depth(mut z: Complex64, c: Complex64, o: f64, p: Complex64, depth: usize) -> (usize, Complex64) {
+    let mut last = Complex64::ZERO;
     for i in 0..depth {
         if z.abs() > 2.0 {
             return (i, z);
         }
-        z = z * z + c;
+        let old_z = z;
+        z = z.powf(o) + p * last + c;
+        last = old_z;
     }
     (depth, z)
 }
@@ -68,7 +75,7 @@ fn main() {
         let x = x as f64 * scale - 2.0;
         let y = y as f64 * scale - 2.0;
         let z = Complex64::new(x, y);
-        let (depth, z) = julia_depth(z, cli.c, cli.depth);
+        let (depth, z) = depth(z, cli.c, cli.exponent, cli.phoenix, cli.depth);
         let renormed = ((depth + 1) as f64
             - z.abs().max(1.0).ln().max(1.0).ln() / std::f64::consts::LN_2)
             / cli.depth as f64;
