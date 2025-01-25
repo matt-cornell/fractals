@@ -1,6 +1,7 @@
 use num_complex::{Complex64, ComplexFloat};
 use eframe::egui;
 use egui::Color32;
+use rayon::prelude::*;
 
 fn make_color(c: u32) -> Color32 {
     let [r, g, b, a] = c.to_be_bytes();
@@ -59,6 +60,7 @@ fn main() {
     let mut depth = 100usize;
     let mut integer_exp = true;
     let mut show_marker = true;
+    let mut renorm = false;
     let mut multibrot_buffer = Vec::new();
     let mut hyperjulia_buffer = Vec::new();
     let mut multibrot_handle = None;
@@ -80,6 +82,9 @@ fn main() {
             if ui.checkbox(&mut show_marker, "Show Marker").changed() {
                 update_multibrot = true;
             }
+            if ui.checkbox(&mut renorm, "Renorm Hyperjulia").changed() {
+                update_hyperjulia = true;
+            }
         });
         egui::Window::new("Params").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -92,7 +97,7 @@ fn main() {
             ui.horizontal(|ui| {
                 ui.label("c: ");
                 ui.vertical(|ui| {
-                    if ui.text_edit_singleline(&mut c_str).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut c_str).desired_width(50.0)).changed() {
                         if let Ok(new_c) = c_str.parse() {
                             c = new_c;
                             update_hyperjulia = true;
@@ -113,7 +118,7 @@ fn main() {
             ui.horizontal(|ui| {
                 ui.label("P: ");
                 ui.vertical(|ui| {
-                    if ui.text_edit_singleline(&mut p_str).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut p_str).desired_width(50.0)).changed() {
                         if let Ok(new_p) = p_str.parse() {
                             phoenix = new_p;
                             update_hyperjulia = true;
@@ -135,12 +140,12 @@ fn main() {
                 ((c.re + 2.0) / scale) as usize, 
                 ((-c.im + 2.0) / scale) as usize, 
             ));
-            for (n, px) in multibrot_buffer.iter_mut().enumerate() {
+            multibrot_buffer.par_iter_mut().enumerate().for_each(|(n, px)| {
                 let (y, x) = num_integer::div_rem(n, multibrot_resolution);
                 if let Some((tx, ty)) = target {
                     if (x == tx && y.abs_diff(ty) < 5) || (y == ty && x.abs_diff(tx) < 5) {
                         *px = Color32::RED;
-                        continue;
+                        return;
                     }
                 }
                 let x = x as f64 * scale - 2.0;
@@ -149,7 +154,7 @@ fn main() {
                 let (d, _) = fractal_depth(Complex64::ZERO, c, exponent, Complex64::ZERO, depth);
                 let d = d as f64 / depth as f64;
                 *px = Color32::from_gray((d.sqrt() * 255.0) as u8);
-            }
+            });
             multibrot.set(
                 egui::ColorImage {
                     size: [multibrot_resolution; 2],
@@ -162,16 +167,19 @@ fn main() {
             update_hyperjulia = false;
             hyperjulia_buffer.resize(hyperjulia_resolution * hyperjulia_resolution, Color32::PLACEHOLDER);
             let scale = 4.0 / (hyperjulia_resolution as f64);
-            for (n, px) in hyperjulia_buffer.iter_mut().enumerate() {
+            hyperjulia_buffer.par_iter_mut().enumerate().for_each(|(n, px)| {
                 let (y, x) = num_integer::div_rem(n, hyperjulia_resolution);
                 let x = x as f64 * scale - 2.0;
                 let y = y as f64 * scale - 2.0;
                 let z = Complex64::new(x, -y);
                 let (d, z) = fractal_depth(z, c, exponent, phoenix, depth);
-                let d = d as f64 / depth as f64;
-                // let d = (d - z.abs().max(1.0).ln().max(1.0).ln() / std::f64::consts::LN_2);
+                let d = if renorm {
+                    ((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln()) / std::f64::consts::LN_2 / depth as f64
+                } else {
+                    d as f64 / depth as f64
+                };
                 *px = Color32::from_gray((d * 255.0) as u8);
-            }
+            });
             hyperjulia.set(
                 egui::ColorImage {
                     size: [hyperjulia_resolution; 2],
@@ -184,7 +192,7 @@ fn main() {
             ui.horizontal(|ui| {
                 ui.label("c: ");
                 ui.vertical(|ui| {
-                    if ui.text_edit_singleline(&mut c_str).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut c_str).desired_width(50.0)).changed() {
                         if let Ok(new_c) = c_str.parse() {
                             c = new_c;
                             update_hyperjulia = true;
