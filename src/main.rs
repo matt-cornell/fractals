@@ -73,12 +73,25 @@ impl Palette {
             }
         }
     }
+    pub fn respace(&mut self) {
+        self.edit.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let step = ((self.edit.len() - 1) as f32).recip();
+        let mut val = 0.0;
+        for (_color, k) in &mut self.edit {
+            *k = val;
+            val += step;
+        }
+    }
 }
 
 fn show_picker(ui: &mut egui::Ui, palette: &mut Palette) -> bool {
     let mut changed = ui
         .checkbox(&mut palette.exponential, "Exponential")
         .changed();
+    if ui.button("Respace").clicked() {
+        palette.respace();
+        changed = true;
+    }
     let mut to_remove = Vec::new();
     let can_remove = palette.edit.len() > 1;
     for (i, (color, k)) in palette.edit.iter_mut().enumerate() {
@@ -423,7 +436,44 @@ fn main() {
             }
         });
         egui::Window::new("Hyperjulia").show(ctx, |ui| {
-            ui.image(&*hyperjulia);
+            let img = ui.image(&*hyperjulia);
+            img.context_menu(|ui| {
+                if ui.button("Save").clicked() {
+                    let dialog = rfd::AsyncFileDialog::new()
+                        .add_filter("Images", &["png"])
+                        .set_file_name("hyperjulia.png");
+                    let buf = hyperjulia_buffer.clone();
+                    std::thread::spawn(move || {
+                        let Some(handle) = futures_lite::future::block_on(dialog.save_file())
+                        else {
+                            return;
+                        };
+                        let Ok(file) = std::fs::File::create(handle.path())
+                            .inspect_err(|err| eprintln!("Failed to open file: {err}"))
+                        else {
+                            return;
+                        };
+                        let mut encoder = png::Encoder::new(
+                            file,
+                            hyperjulia_resolution as _,
+                            hyperjulia_resolution as _,
+                        );
+                        encoder.set_color(png::ColorType::Rgba);
+                        let Ok(mut writer) = encoder
+                            .write_header()
+                            .inspect_err(|err| eprintln!("Failed to write header: {err}"))
+                        else {
+                            return;
+                        };
+                        if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buf)) {
+                            eprintln!("Failed to write image data: {err}");
+                        }
+                        if let Err(err) = writer.finish() {
+                            eprintln!("Failed to finish writing: {err}");
+                        }
+                    });
+                }
+            });
         });
     })
     .unwrap();
