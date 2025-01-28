@@ -230,6 +230,7 @@ fn main() {
                     {
                         if let Ok(new_p) = p_str.parse() {
                             phoenix = new_p;
+                            update_multibrot = true;
                             update_hyperjulia = true;
                             invalid_p = false;
                         } else {
@@ -336,7 +337,7 @@ fn main() {
                     let y = y as f64 * scale - 2.0;
                     let c = Complex64::new(x, -y);
                     let (d, _) =
-                        fractal_depth(Complex64::ZERO, c, exponent, Complex64::ZERO, depth);
+                        fractal_depth(Complex64::ZERO, c, exponent, phoenix, depth);
                     let upper = upper_palette.palette[d];
                     let color = if let Some(lower) = &lower_palette {
                         upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
