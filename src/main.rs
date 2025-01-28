@@ -434,6 +434,44 @@ fn main() {
                     update_multibrot = true;
                     c_str = c.to_string();
                 }
+            } else {
+                img.context_menu(|ui| {
+                    if ui.button("Save").clicked() {
+                        let dialog = rfd::AsyncFileDialog::new()
+                            .add_filter("Images", &["png"])
+                            .set_file_name("multibrot.png");
+                        let buf = multibrot_buffer.clone();
+                        std::thread::spawn(move || {
+                            let Some(handle) = futures_lite::future::block_on(dialog.save_file())
+                            else {
+                                return;
+                            };
+                            let Ok(file) = std::fs::File::create(handle.path())
+                                .inspect_err(|err| eprintln!("Failed to open file: {err}"))
+                            else {
+                                return;
+                            };
+                            let mut encoder = png::Encoder::new(
+                                file,
+                                hyperjulia_resolution as _,
+                                hyperjulia_resolution as _,
+                            );
+                            encoder.set_color(png::ColorType::Rgba);
+                            let Ok(mut writer) = encoder
+                                .write_header()
+                                .inspect_err(|err| eprintln!("Failed to write header: {err}"))
+                            else {
+                                return;
+                            };
+                            if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buf)) {
+                                eprintln!("Failed to write image data: {err}");
+                            }
+                            if let Err(err) = writer.finish() {
+                                eprintln!("Failed to finish writing: {err}");
+                            }
+                        });
+                    }
+                });
             }
         });
         egui::Window::new("Hyperjulia").show(ctx, |ui| {
