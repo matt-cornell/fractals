@@ -370,12 +370,15 @@ fn main() {
                     let y = y as f64 * scale - 2.0;
                     let z = Complex64::new(x, -y);
                     let (d, z) = fractal_depth(z, c, exponent, phoenix, depth);
-                    let d = if renorm {
+                    let mut d = if renorm {
                         (((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln())
                             / std::f64::consts::LN_2) as usize
                     } else {
                         d
                     };
+                    if d >= upper_palette.palette.len() {
+                        d = upper_palette.palette.len();
+                    }
                     let upper = upper_palette.palette[d];
                     let color = if let Some(lower) = &lower_palette {
                         upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
