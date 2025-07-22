@@ -264,17 +264,15 @@ fn main() {
             }
         });
         egui::Window::new("Colors").show(ctx, |ui| {
-            let mut changed = ui
-                .collapsing(
-                    if lower_palette.is_some() {
-                        "Upper"
-                    } else {
-                        "Gradient"
-                    },
-                    |ui| show_picker(ui, &mut upper_palette),
-                )
-                .body_returned
-                .unwrap_or(false);
+            let mut changed = egui::CollapsingHeader::new(if lower_palette.is_some() {
+                "Upper"
+            } else {
+                "Gradient"
+            })
+            .id_salt("Upper")
+            .show(ui, |ui| show_picker(ui, &mut upper_palette))
+            .body_returned
+            .unwrap_or(false);
             let mut show_lower = lower_palette.is_some();
             changed |= ui.checkbox(&mut show_lower, "Lower").changed();
             if show_lower {
@@ -336,8 +334,7 @@ fn main() {
                     let x = x as f64 * scale - 2.0;
                     let y = y as f64 * scale - 2.0;
                     let c = Complex64::new(x, -y);
-                    let (d, _) =
-                        fractal_depth(Complex64::ZERO, c, exponent, phoenix, depth);
+                    let (d, _) = fractal_depth(Complex64::ZERO, c, exponent, phoenix, depth);
                     let upper = upper_palette.palette[d];
                     let color = if let Some(lower) = &lower_palette {
                         upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
