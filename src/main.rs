@@ -14,6 +14,16 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Duration;
 
+mod math;
+
+macro_rules! load_text {
+    ($path:literal, $style:expr) => {{
+        static LOCK: std::sync::LazyLock<eframe::egui::text::LayoutJob> =
+            std::sync::LazyLock::new(|| $crate::math::parse_text(include_str!($path)));
+        $crate::math::adapt_parsed(&*LOCK, $style)
+    }};
+}
+
 fn fractal_depth(
     o: f64,
     mut z: Complex64,
@@ -827,7 +837,7 @@ fn main() {
     let mut save_config = None;
     let mut load_config = None;
     eframe::run_simple_native(
-        "Hyperjulia",
+        "Fractal Explorer",
         eframe::NativeOptions {
             centered: true,
             viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1280.0, 900.0)),
@@ -1215,6 +1225,20 @@ fn main() {
                     z.mark_changed();
                     c.mark_changed();
                 }
+            });
+            egui::Window::new("Recommended Reading").default_size(egui::vec2(300.0, 400.0)).default_open(false).default_pos(egui::pos2(1000.0, 800.0)).show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Iterative Fractals");
+                    ui.label(load_text!("info/iterative-fractal.txt", &ui.style()));
+                    ui.heading("The Mandelbrot Set");
+                    ui.label(load_text!("info/mandelbrot-set.txt", &ui.style()));
+                    ui.heading("Julia Sets");
+                    ui.label(load_text!("info/julia-sets.txt", &ui.style()));
+                    ui.heading("Higher Exponents");
+                    ui.label(load_text!("info/higher-exponents.txt", &ui.style()));
+                    ui.heading("Phoenix Fractals");
+                    ui.label(load_text!("info/phoenix-fractals.txt", &ui.style()));
+                });
             });
             if let Some(fut) = &mut save_config {
                 if let Poll::Ready(handle) =

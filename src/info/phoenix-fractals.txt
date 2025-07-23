@@ -1,0 +1,5 @@
+So far, we've discussed the Z and C planes in this app, but there's a third parameter: P. The classic phoenix fractals generalize the Mandelbrot and Julia fractals with the recurrence relation z_{n + 1} = z_n^2 + c + Pz_{n - 1}, with z_{-1} = 0. They also conventionally swap the real and imaginary axes, but that would be additional work, so they aren't done in this app.
+
+This parameter makes our fractals more chaotic, but we can still find some symmetries in them. When any two parameters are fully real, the image in the remaining plane will be symmetric over the real axis. This can be proven as follows:
+
+We can prove our fractal's symmetry with over the real axis by proving z'_n = conj(z_n) for all n. All of these operations distribute conjugates, so conj(z_{n + 1}) = conj(z_n)^2 + conj(c) + conj(P)z_{n - 1}. This requires that z'_0 = conj(z_0), c' = conj(c), and P' = conj(P), and only real constant parameters fulfill this.

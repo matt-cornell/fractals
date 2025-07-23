@@ -1,0 +1,1 @@
+An iterative fractal takes the a function f(z) and applies it to itself, with some recurrence relation z_{n + 1} = f(z_n). If the sequence remains bounded for an initial state, the point is in the fractal. The number of steps it takes to escape can be used to color the rest of the fractal.

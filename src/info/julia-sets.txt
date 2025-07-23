@@ -1,0 +1,3 @@
+Julia sets have a similar recurrence relation to the Mandelbrot set: z_{n + 1} = z^2 + c. However, in the case of Julia sets, it's z_0 that's varied, and c is a constant parameter for the set. In this app, it's referred to as the Z-plane fractal because of the variance in the starting z value.
+
+Julia sets have order 2 rotational symmetry because each term squares the previous, removing the negative. For any z_0, z_1 = z_0^2 + c, but if we start with -z_0 instead, we get the same value of z_0^2 + c for z_1.

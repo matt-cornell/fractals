@@ -1,0 +1,3 @@
+The Mandelbrot set is an iterative fractal for which a complex number c is contained if the recurrence relation z_{n + 1} = z^2 + c remains bounded with a starting z_0 of 0. Because the c parameter is varied, this is referred to as the C-plane fractal in this app.
+
+An interesting property of the Mandelbrot set is its symmetry. Since conjugation preserves both steps in our iteration: conj(z^2) = conj(z)^2 and conj(z) + conj(c) = conj(z + c), conjugating c conjugates every term in the series, but if the series stays bounded, then it also remains bounded for its conjugate. This gives the Mandelbrot set its mirror symmetry over the real axis.
