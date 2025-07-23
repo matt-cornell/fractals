@@ -2,6 +2,9 @@ use eframe::egui;
 use egui::Color32;
 use num_complex::{Complex64, ComplexFloat};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 fn fractal_depth(
     mut z: Complex64,
@@ -126,6 +129,187 @@ fn show_picker(ui: &mut egui::Ui, palette: &mut Palette) -> bool {
     changed
 }
 
+mod serde_stops {
+    use eframe::egui::ecolor::ParseHexColorError;
+    use eframe::egui::Color32;
+    use serde::de::{Error, Unexpected};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt::Write;
+    struct ColorShim(Color32, f32);
+    impl<'de> Deserialize<'de> for ColorShim {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            const EXPECTED: &str = "A hex-formatted color, '@', and a position";
+            let val: &str = Deserialize::deserialize(deserializer)?;
+            let idx = val
+                .find('@')
+                .ok_or_else(|| Error::invalid_value(Unexpected::Str(val), &EXPECTED))?;
+            let color = Color32::from_hex(&val[..idx]).map_err(|err| match err {
+                ParseHexColorError::MissingHash => {
+                    Error::invalid_value(Unexpected::Str(val), &EXPECTED)
+                }
+                ParseHexColorError::InvalidLength => {
+                    Error::invalid_value(Unexpected::Str(val), &EXPECTED)
+                }
+                ParseHexColorError::InvalidInt(_) => {
+                    Error::invalid_value(Unexpected::Str(val), &EXPECTED)
+                }
+            })?;
+            let pos = val[(idx + 1)..]
+                .parse()
+                .map_err(|_| Error::invalid_value(Unexpected::Str(val), &EXPECTED))?;
+            Ok(Self(color, pos))
+        }
+    }
+    #[allow(clippy::ptr_arg)]
+    pub fn serialize<S: Serializer>(
+        vec: &Vec<(Color32, f32)>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        vec.iter()
+            .map(|(c, p)| {
+                let mut out = c.to_hex();
+                let _ = write!(out, "@{p:.4}");
+                while out.ends_with('0') {
+                    out.pop();
+                }
+                if out.ends_with('.') {
+                    out.push('0');
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(Color32, f32)>, D::Error> {
+        let raw = Vec::<ColorShim>::deserialize(deserializer)?;
+        Ok(raw.into_iter().map(|c| (c.0, c.1)).collect())
+    }
+}
+
+mod serde_palette {
+    use super::PaletteSerde;
+    use serde::de::{Error, MapAccess, Visitor};
+    use serde::ser::SerializeStruct;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<PaletteSerde>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            None => serializer.serialize_none(),
+            Some(PaletteSerde::Single { palette }) => {
+                let mut s = serializer.serialize_struct("Palette", 1)?;
+                s.serialize_field("palette", palette)?;
+                s.end()
+            }
+            Some(PaletteSerde::Split { upper, lower }) => {
+                let mut s = serializer.serialize_struct("Palette", 2)?;
+                s.serialize_field("upper", upper)?;
+                s.serialize_field("lower", lower)?;
+                s.end()
+            }
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<PaletteSerde>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", field_identifier)]
+        enum Field {
+            Palette,
+            Upper,
+            Lower,
+            Unknown(serde::de::IgnoredAny),
+        }
+
+        struct PaletteVisitor;
+        impl<'de> Visitor<'de> for PaletteVisitor {
+            type Value = Option<PaletteSerde>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("palette data")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut palette = None;
+                let mut upper = None;
+                let mut lower = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Palette => {
+                            if palette.is_some() {
+                                return Err(Error::duplicate_field("palette"));
+                            }
+                            palette = Some(map.next_value()?)
+                        }
+                        Field::Upper => {
+                            if upper.is_some() {
+                                return Err(Error::duplicate_field("upper"));
+                            }
+                            upper = Some(map.next_value()?);
+                        }
+                        Field::Lower => {
+                            if lower.is_some() {
+                                return Err(Error::duplicate_field("lower"));
+                            }
+                            lower = Some(map.next_value()?);
+                        }
+                        Field::Unknown(_) => {}
+                    }
+                }
+                match (palette, upper, lower) {
+                    (_, Some(upper), Some(lower)) => Ok(Some(PaletteSerde::Split { upper, lower })),
+                    (Some(palette), _, _) => Ok(Some(PaletteSerde::Single { palette })),
+                    (None, None, None) => Ok(None),
+                    (None, None, Some(_)) => Err(Error::missing_field("upper")),
+                    (None, Some(_), None) => Err(Error::missing_field("lower")),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(PaletteVisitor)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PaletteData {
+    #[serde(default)]
+    exponential: bool,
+    #[serde(with = "serde_stops")]
+    stops: Vec<(Color32, f32)>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PaletteSerde {
+    Single {
+        palette: PaletteData,
+    },
+    Split {
+        upper: PaletteData,
+        lower: PaletteData,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct AppState {
+    exponent: f64,
+    depth: usize,
+    c: String,
+    #[serde(rename = "P")]
+    p: String,
+    #[serde(flatten, with = "serde_palette")]
+    palette: Option<PaletteSerde>,
+}
+
 fn main() {
     let mut multibrot_resolution = 256;
     let mut hyperjulia_resolution = 512;
@@ -148,8 +332,153 @@ fn main() {
     let mut invalid_p = false;
     let mut upper_palette = Palette::bw();
     let mut lower_palette = None::<Palette>;
+    let mut file_res = Ok::<_, String>(false);
+    let mut edit_res = Ok::<_, String>(());
+    let mut edit_buf = String::new();
     upper_palette.regenerate(depth, false);
+    let mut save_config = None;
+    let mut load_config = None;
+    let mut save_brot = None;
+    let mut save_julia = None;
+    let mut save_brot_res: Result<(), String> = Ok(());
+    let mut save_julia_res: Result<(), String> = Ok(());
     eframe::run_simple_native("Hyperjulia", Default::default(), move |ctx, _| {
+        egui::Window::new("Editor").show(ctx, |ui| {
+            if update_multibrot || update_hyperjulia {
+                let res = serde_json::to_string_pretty(&AppState {
+                    exponent,
+                    depth,
+                    c: c_str.clone(),
+                    p: p_str.clone(),
+                    palette: Some(if let Some(lower) = &lower_palette {
+                        PaletteSerde::Split {
+                            upper: PaletteData {
+                                exponential: upper_palette.exponential,
+                                stops: upper_palette.stops.clone(),
+                            },
+                            lower: PaletteData {
+                                exponential: lower.exponential,
+                                stops: lower.stops.clone(),
+                            },
+                        }
+                    } else {
+                        PaletteSerde::Single {
+                            palette: PaletteData {
+                                exponential: upper_palette.exponential,
+                                stops: upper_palette.stops.clone(),
+                            },
+                        }
+                    }),
+                });
+                if let Ok(new) = res {
+                    edit_buf = new;
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save_config = Some(Box::pin(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("JSON", &["json"])
+                            .save_file(),
+                    ));
+                }
+                if ui.button("Load").clicked() {
+                    load_config = Some(Box::pin(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("JSON", &["json"])
+                            .pick_file(),
+                    ));
+                }
+            });
+            let force_changed;
+            match file_res {
+                Ok(ref mut ch) => force_changed = std::mem::take(ch),
+                Err(ref err) => {
+                    force_changed = false;
+                    let visuals = &ui.style().visuals;
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("Invalid data: {err}"))
+                                    .color(visuals.error_fg_color)
+                                    .background_color(visuals.extreme_bg_color),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        file_res = Ok(false);
+                    }
+                }
+            }
+            if let Err(err) = &edit_res {
+                let visuals = &ui.style().visuals;
+                ui.label(
+                    egui::RichText::new(format!("Invalid data: {err}"))
+                        .color(visuals.error_fg_color)
+                        .background_color(visuals.extreme_bg_color),
+                );
+            }
+            if ui.code_editor(&mut edit_buf).changed() || force_changed {
+                match serde_json::from_str::<AppState>(&edit_buf) {
+                    Ok(state) => {
+                        edit_res = Ok(());
+                        exponent = state.exponent;
+                        if exponent % 1.0 != 0.0 {
+                            integer_exp = false;
+                        }
+                        depth = state.depth;
+                        c_str = state.c;
+                        p_str = state.p;
+                        update_multibrot = true;
+                        update_hyperjulia = true;
+                        if let Ok(new_c) = c_str.parse() {
+                            c = new_c;
+                            update_hyperjulia = true;
+                            if show_marker {
+                                update_multibrot = true;
+                            }
+                            invalid_c = false;
+                        } else {
+                            invalid_c = true;
+                        }
+                        if let Ok(new_p) = p_str.parse() {
+                            phoenix = new_p;
+                            update_hyperjulia = true;
+                            update_multibrot = true;
+                            invalid_p = false;
+                        } else {
+                            invalid_p = true;
+                        }
+                        if let Some(p) = state.palette {
+                            match p {
+                                PaletteSerde::Single { palette } => {
+                                    upper_palette.exponential = palette.exponential;
+                                    upper_palette.edit = palette.stops;
+                                    upper_palette.regenerate(depth, true);
+                                    lower_palette = None;
+                                }
+                                PaletteSerde::Split { upper, lower } => {
+                                    upper_palette.exponential = upper.exponential;
+                                    upper_palette.edit = upper.stops;
+                                    upper_palette.regenerate(depth, true);
+                                    let lower_palette = lower_palette.get_or_insert(Palette {
+                                        edit: Vec::new(),
+                                        stops: Vec::new(),
+                                        exponential: false,
+                                        palette: Vec::new(),
+                                    });
+                                    lower_palette.exponential = lower.exponential;
+                                    lower_palette.edit = lower.stops;
+                                    lower_palette.regenerate(depth, true);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => edit_res = Err(err.to_string()),
+                }
+            }
+        });
         egui::Window::new("Display").show(ctx, |ui| {
             if ui
                 .add(
@@ -421,6 +750,22 @@ fn main() {
                     }
                 });
             });
+            if let Err(err) = &save_brot_res {
+                let visuals = &ui.style().visuals;
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(err)
+                                .color(visuals.error_fg_color)
+                                .background_color(visuals.extreme_bg_color),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .clicked()
+                {
+                    save_brot_res = Ok(());
+                }
+            }
             let mut img = ui.image(&*multibrot);
             if show_marker {
                 img = img.interact(egui::Sense::click_and_drag());
@@ -437,83 +782,147 @@ fn main() {
             } else {
                 img.context_menu(|ui| {
                     if ui.button("Save").clicked() {
-                        let dialog = rfd::AsyncFileDialog::new()
-                            .add_filter("Images", &["png"])
-                            .set_file_name("multibrot.png");
-                        let buf = multibrot_buffer.clone();
-                        std::thread::spawn(move || {
-                            let Some(handle) = futures_lite::future::block_on(dialog.save_file())
-                            else {
-                                return;
-                            };
-                            let Ok(file) = std::fs::File::create(handle.path())
-                                .inspect_err(|err| eprintln!("Failed to open file: {err}"))
-                            else {
-                                return;
-                            };
-                            let mut encoder = png::Encoder::new(
-                                file,
-                                hyperjulia_resolution as _,
-                                hyperjulia_resolution as _,
-                            );
-                            encoder.set_color(png::ColorType::Rgba);
-                            let Ok(mut writer) = encoder
-                                .write_header()
-                                .inspect_err(|err| eprintln!("Failed to write header: {err}"))
-                            else {
-                                return;
-                            };
-                            if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buf)) {
-                                eprintln!("Failed to write image data: {err}");
-                            }
-                            if let Err(err) = writer.finish() {
-                                eprintln!("Failed to finish writing: {err}");
-                            }
-                        });
+                        save_brot = Some(Box::pin(
+                            rfd::AsyncFileDialog::new()
+                                .add_filter("Images", &["png"])
+                                .set_file_name("multibrot.png")
+                                .save_file(),
+                        ));
                     }
                 });
             }
         });
         egui::Window::new("Hyperjulia").show(ctx, |ui| {
+            if let Err(err) = &save_julia_res {
+                let visuals = &ui.style().visuals;
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(err)
+                                .color(visuals.error_fg_color)
+                                .background_color(visuals.extreme_bg_color),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .clicked()
+                {
+                    save_julia_res = Ok(());
+                }
+            }
             let img = ui.image(&*hyperjulia);
             img.context_menu(|ui| {
                 if ui.button("Save").clicked() {
-                    let dialog = rfd::AsyncFileDialog::new()
-                        .add_filter("Images", &["png"])
-                        .set_file_name("hyperjulia.png");
-                    let buf = hyperjulia_buffer.clone();
-                    std::thread::spawn(move || {
-                        let Some(handle) = futures_lite::future::block_on(dialog.save_file())
-                        else {
-                            return;
-                        };
-                        let Ok(file) = std::fs::File::create(handle.path())
-                            .inspect_err(|err| eprintln!("Failed to open file: {err}"))
-                        else {
-                            return;
-                        };
-                        let mut encoder = png::Encoder::new(
-                            file,
-                            hyperjulia_resolution as _,
-                            hyperjulia_resolution as _,
-                        );
-                        encoder.set_color(png::ColorType::Rgba);
-                        let Ok(mut writer) = encoder
-                            .write_header()
-                            .inspect_err(|err| eprintln!("Failed to write header: {err}"))
-                        else {
-                            return;
-                        };
-                        if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buf)) {
-                            eprintln!("Failed to write image data: {err}");
-                        }
-                        if let Err(err) = writer.finish() {
-                            eprintln!("Failed to finish writing: {err}");
-                        }
-                    });
+                    save_julia = Some(Box::pin(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Images", &["png"])
+                            .set_file_name("hyperjulia.png")
+                            .save_file(),
+                    ));
                 }
             });
         });
+        if let Some(fut) = &mut save_config {
+            if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            {
+                save_config = None;
+                if let Some(handle) = handle {
+                    if let Err(err) = std::fs::write(handle.path(), &edit_buf) {
+                        file_res = Err(format!("Failed to save config: {err}"))
+                    } else {
+                        file_res = Ok(false);
+                    }
+                }
+            }
+        }
+        if let Some(fut) = &mut load_config {
+            if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            {
+                load_config = None;
+                if let Some(handle) = handle {
+                    match std::fs::read_to_string(handle.path()) {
+                        Ok(buf) => {
+                            edit_buf = buf;
+                            file_res = Ok(true);
+                        }
+                        Err(err) => file_res = Err(format!("Failed to load config: {err}")),
+                    }
+                }
+            }
+        }
+        if let Some(fut) = &mut save_brot {
+            if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            {
+                save_brot = None;
+                'save: {
+                    let Some(handle) = handle else {
+                        break 'save;
+                    };
+                    let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
+                        save_brot_res = Err(format!("Failed to open file: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    let mut encoder = png::Encoder::new(
+                        file,
+                        multibrot_resolution as _,
+                        multibrot_resolution as _,
+                    );
+                    encoder.set_color(png::ColorType::Rgba);
+                    let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
+                        save_brot_res = Err(format!("Failed to save imager: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    if let Err(err) =
+                        writer.write_image_data(bytemuck::cast_slice(&multibrot_buffer))
+                    {
+                        save_brot_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                    if let Err(err) = writer.finish() {
+                        save_brot_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                }
+            }
+        }
+        if let Some(fut) = &mut save_julia {
+            if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            {
+                save_julia = None;
+                'save: {
+                    let Some(handle) = handle else {
+                        break 'save;
+                    };
+                    let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
+                        save_julia_res = Err(format!("Failed to open file: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    let mut encoder = png::Encoder::new(
+                        file,
+                        hyperjulia_resolution as _,
+                        hyperjulia_resolution as _,
+                    );
+                    encoder.set_color(png::ColorType::Rgba);
+                    let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
+                        save_julia_res = Err(format!("Failed to save image: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    if let Err(err) =
+                        writer.write_image_data(bytemuck::cast_slice(&hyperjulia_buffer))
+                    {
+                        save_julia_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                    if let Err(err) = writer.finish() {
+                        save_julia_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                }
+            }
+        }
     })
     .unwrap();
 }
