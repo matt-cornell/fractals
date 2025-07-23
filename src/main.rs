@@ -990,6 +990,9 @@ fn main() {
                     }
                 }
             });
+            z.update(FractalPlane::Z, &common, [z.param, c.param, p.param], ctx);
+            c.update(FractalPlane::C, &common, [z.param, c.param, p.param], ctx);
+            p.update(FractalPlane::P, &common, [z.param, c.param, p.param], ctx);
             egui::Window::new("Params").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -1029,7 +1032,7 @@ fn main() {
             egui::Window::new("Colors").show(ctx, |ui| {
                 let renorm_box = ui.checkbox(&mut common.renorm, "Renormalize");
                 if renorm_box.hovered() {
-                    renorm_box.show_tooltip_text("Renormalization can help reduce banding in the images, but gives somewhat dimmer results. Try it to see the difference!");
+                    renorm_box.show_tooltip_text("Renormalization can help reduce banding in the images, and the results look slightly more vibrant. Try it to see the difference!");
                 }
                 let mut changed = renorm_box.changed();
                 let mut show_lower = common.lower.is_some();
@@ -1104,7 +1107,7 @@ fn main() {
                                     export_size,
                                     &common,
                                     &mut buffer,
-                                    Some(&|| state.fetch_add(1, Ordering::AcqRel) < CANCELLING),
+                                    Some(&|| state.fetch_add(1, Ordering::AcqRel) >= CANCELLING),
                                 );
                                 if broke {
                                     state.store(READY, Ordering::Release);
@@ -1235,9 +1238,6 @@ fn main() {
                     }
                 }
             });
-            z.update(FractalPlane::Z, &common, [z.param, c.param, p.param], ctx);
-            c.update(FractalPlane::C, &common, [z.param, c.param, p.param], ctx);
-            p.update(FractalPlane::P, &common, [z.param, c.param, p.param], ctx);
             egui::Window::new("Z-Plane").show(ctx, |ui| {
                 if z.show("z", FractalPlane::Z, &common, [z.param, c.param, p.param], ui) {
                     c.mark_changed();
