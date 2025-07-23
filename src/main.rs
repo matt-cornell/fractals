@@ -777,6 +777,17 @@ fn main() {
                                         handle = h;
                                         break;
                                     }
+                                    if state
+                                        .compare_exchange(
+                                            CANCELLING,
+                                            READY,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
+                                        .is_ok()
+                                    {
+                                        return;
+                                    }
                                     let n = waker_handle.notified.swap(false, Ordering::AcqRel);
                                     if !n {
                                         std::thread::park_timeout(
@@ -842,8 +853,8 @@ fn main() {
                         });
                     }
                     step => {
+                        let progress = step as f32 / (export_size * export_size) as f32;
                         ui.horizontal(|ui| {
-                            let progress = step as f32 / (export_size * export_size) as f32;
                             ui.spinner();
                             ui.label(format!(
                                 "Processing {}/{} ({:.1}%)",
@@ -851,8 +862,11 @@ fn main() {
                                 export_size * export_size,
                                 progress * 100.0
                             ));
-                            ui.add(egui::ProgressBar::new(progress));
+                            if ui.button("Cancel").clicked() {
+                                export_state.store(CANCELLING, Ordering::Release);
+                            }
                         });
+                        ui.add(egui::ProgressBar::new(progress));
                     }
                 }
                 if let Err(err) = &*export_res.lock().unwrap() {
