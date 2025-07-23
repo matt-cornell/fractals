@@ -821,6 +821,36 @@ fn add_marker(target: Complex64, resolution: usize, buffer: &mut Vec<Color32>) {
     }
 }
 
+fn scrollable_text(buf: &mut String, ui: &mut egui::Ui) -> egui::Response {
+    let available = ui.available_rect_before_wrap();
+    let where_to_put_background = ui.painter().add(egui::Shape::Noop);
+    let sao = egui::ScrollArea::both().show(ui, |ui| {
+        ui.set_min_size(available.size());
+        ui.set_clip_rect(available);
+        ui.add_sized(
+            available.size(),
+            egui::TextEdit::multiline(buf).code_editor().frame(false),
+        )
+    });
+    let visuals = ui.visuals();
+    let widget = ui.style().interact(&sao.inner);
+    let background = visuals.text_edit_bg_color();
+    let stroke = if sao.inner.has_focus() {
+        visuals.selection.stroke
+    } else {
+        widget.bg_stroke
+    };
+    let shape = egui::epaint::RectShape::new(
+        available,
+        widget.corner_radius,
+        background,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().set(where_to_put_background, shape);
+    sao.inner
+}
+
 fn main() {
     let mut z = ImageData::default();
     let mut c = ImageData::default();
@@ -844,7 +874,7 @@ fn main() {
             ..Default::default()
         },
         move |ctx, _| {
-            egui::Window::new("Editor").show(ctx, |ui| {
+            egui::Window::new("Editor").default_size(egui::vec2(250.0, 250.0)).show(ctx, |ui| {
                 if z.changed || c.changed || p.changed {
                     let res = serde_json::to_string_pretty(&AppState {
                         exponent: common.exponent,
@@ -913,7 +943,7 @@ fn main() {
                             .background_color(visuals.extreme_bg_color),
                     );
                 }
-                if ui.code_editor(&mut edit_buf).changed() || force_changed {
+                if scrollable_text(&mut edit_buf, ui).changed() || force_changed {
                     match serde_json::from_str::<AppState>(&edit_buf) {
                         Ok(state) => {
                             edit_res = Ok(());
@@ -1037,7 +1067,7 @@ fn main() {
             });
             egui::Window::new("Export").show(ctx, |ui| {
                 let state = export_state.load(Ordering::Acquire);
-                egui::ComboBox::new("Fractal Plane", "Fractal")
+                egui::ComboBox::new("Fractal Plane", "Fractal Plane")
                     .selected_text(match export_sel {
                         FractalPlane::Z => "z",
                         FractalPlane::C => "c",
