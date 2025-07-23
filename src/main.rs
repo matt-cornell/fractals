@@ -4,7 +4,10 @@ use num_complex::{Complex64, ComplexFloat};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::Thread;
 
 fn fractal_depth(
     mut z: Complex64,
@@ -310,6 +313,33 @@ struct AppState {
     palette: Option<PaletteSerde>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ExportSelection {
+    Multibrot,
+    Phoenix,
+    Hyperjulia,
+}
+
+struct ThreadWaker {
+    thread: Thread,
+    notified: AtomicBool,
+}
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+const SPECIAL_BASE: usize = usize::MAX >> 2;
+const READY: usize = SPECIAL_BASE;
+const WAITING: usize = SPECIAL_BASE + 1;
+const CANCELLING: usize = SPECIAL_BASE >> 1;
+
 fn main() {
     let mut multibrot_resolution = 256;
     let mut phoenix_resolution = 256;
@@ -340,6 +370,10 @@ fn main() {
     let mut edit_res = Ok::<_, String>(());
     let mut edit_buf = String::new();
     upper_palette.regenerate(depth, false);
+    let mut export_sel = ExportSelection::Hyperjulia;
+    let mut export_size = 8192;
+    let export_state = Arc::new(AtomicUsize::new(READY));
+    let export_res = Arc::new(Mutex::new(Ok(())));
     let mut save_config = None;
     let mut load_config = None;
     let mut save_brot = None;
@@ -648,6 +682,194 @@ fn main() {
                     }
                     update_multibrot = true;
                     update_hyperjulia = true;
+                }
+            });
+            egui::Window::new("Export").show(ctx, |ui| {
+                let state = export_state.load(Ordering::Acquire);
+                egui::ComboBox::new("Export Kind", "Fractal")
+                    .selected_text(format!("{export_sel:?}"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut export_sel,
+                            ExportSelection::Multibrot,
+                            "Multibrot",
+                        );
+                        ui.selectable_value(&mut export_sel, ExportSelection::Phoenix, "Phoenix");
+                        ui.selectable_value(
+                            &mut export_sel,
+                            ExportSelection::Hyperjulia,
+                            "Hyperjulia",
+                        );
+                    });
+                ui.add_enabled(
+                    state == READY,
+                    egui::Slider::new(&mut export_size, 0..=10000)
+                        .clamping(egui::SliderClamping::Never)
+                        .logarithmic(true),
+                );
+
+                match state {
+                    READY => {
+                        if ui.button("Export").clicked() {
+                            *export_res.lock().unwrap() = Ok(());
+                            let state = Arc::clone(&export_state);
+                            let upper_palette = upper_palette.clone();
+                            let lower_palette = lower_palette.clone();
+                            let res = Arc::clone(&export_res);
+                            std::thread::spawn(move || {
+                                state.store(0, Ordering::Release);
+                                let mut buffer =
+                                    vec![Color32::PLACEHOLDER; export_size * export_size];
+                                let scale = 4.0 / (export_size as f64);
+                                let succ = buffer
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(n, px)| {
+                                        let (y, x) = num_integer::div_rem(n, export_size);
+                                        let x = x as f64 * scale - 2.0;
+                                        let y = y as f64 * scale - 2.0;
+                                        let (z, c, p) = match export_sel {
+                                            ExportSelection::Multibrot => {
+                                                (Complex64::ZERO, Complex64::new(x, -y), p)
+                                            }
+                                            ExportSelection::Phoenix => {
+                                                (Complex64::ZERO, c, Complex64::new(x, -y))
+                                            }
+                                            ExportSelection::Hyperjulia => {
+                                                (Complex64::new(x, -y), c, p)
+                                            }
+                                        };
+                                        let (d, _) = fractal_depth(z, c, exponent, p, depth);
+                                        let upper = upper_palette.palette[d];
+                                        let color = if let Some(lower) = &lower_palette {
+                                            upper.lerp_to_gamma(
+                                                lower.palette[d],
+                                                y.mul_add(0.25, 0.5) as _,
+                                            )
+                                        } else {
+                                            upper
+                                        };
+
+                                        *px = color;
+
+                                        state.fetch_add(1, Ordering::AcqRel) < CANCELLING
+                                    })
+                                    .all(|v| v);
+                                if !succ {
+                                    state.store(READY, Ordering::Release);
+                                    return;
+                                }
+                                state.store(WAITING, Ordering::Release);
+                                let fut = rfd::AsyncFileDialog::new()
+                                    .add_filter("Images", &["png"])
+                                    .set_file_name("fractal.png")
+                                    .save_file();
+                                let mut fut = std::pin::pin!(fut);
+                                let waker_handle = Arc::new(ThreadWaker {
+                                    thread: std::thread::current(),
+                                    notified: AtomicBool::new(true),
+                                });
+                                let waker = waker_handle.clone().into();
+                                let mut cx = Context::from_waker(&waker);
+                                let handle;
+                                loop {
+                                    if let Poll::Ready(h) = fut.as_mut().poll(&mut cx) {
+                                        handle = h;
+                                        break;
+                                    }
+                                    let n = waker_handle.notified.swap(false, Ordering::AcqRel);
+                                    if !n {
+                                        std::thread::park_timeout(
+                                            std::time::Duration::from_millis(100),
+                                        );
+                                    }
+                                }
+                                let Some(handle) = handle else {
+                                    state.store(READY, Ordering::Release);
+                                    return;
+                                };
+
+                                'save: {
+                                    let Ok(file) = std::fs::File::create(handle.path())
+                                        .inspect_err(|err| {
+                                            *res.lock().unwrap() =
+                                                Err(format!("Failed to open file: {err}"))
+                                        })
+                                    else {
+                                        break 'save;
+                                    };
+                                    let mut encoder =
+                                        png::Encoder::new(file, export_size as _, export_size as _);
+                                    encoder.set_color(png::ColorType::Rgba);
+                                    let Ok(mut writer) =
+                                        encoder.write_header().inspect_err(|err| {
+                                            *res.lock().unwrap() =
+                                                Err(format!("Failed to save image: {err}"))
+                                        })
+                                    else {
+                                        break 'save;
+                                    };
+                                    if let Err(err) =
+                                        writer.write_image_data(bytemuck::cast_slice(&buffer))
+                                    {
+                                        *res.lock().unwrap() =
+                                            Err(format!("Failed to save image: {err}"));
+                                        break 'save;
+                                    }
+                                    if let Err(err) = writer.finish() {
+                                        *res.lock().unwrap() =
+                                            Err(format!("Failed to save image: {err}"));
+                                        break 'save;
+                                    }
+                                }
+
+                                state.store(READY, Ordering::Release);
+                            });
+                        }
+                    }
+                    WAITING => {
+                        ui.horizontal(|ui| {
+                            ui.label("Ready to save");
+                            if ui.button("Cancel").clicked() {
+                                export_state.store(CANCELLING, Ordering::Release);
+                            }
+                        });
+                    }
+                    CANCELLING..SPECIAL_BASE => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Cancelling...");
+                        });
+                    }
+                    step => {
+                        ui.horizontal(|ui| {
+                            let progress = step as f32 / (export_size * export_size) as f32;
+                            ui.spinner();
+                            ui.label(format!(
+                                "Processing {}/{} ({:.1}%)",
+                                step,
+                                export_size * export_size,
+                                progress * 100.0
+                            ));
+                            ui.add(egui::ProgressBar::new(progress));
+                        });
+                    }
+                }
+                if let Err(err) = &*export_res.lock().unwrap() {
+                    let visuals = &ui.style().visuals;
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(err)
+                                    .color(visuals.error_fg_color)
+                                    .background_color(visuals.extreme_bg_color),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        file_res = Ok(false);
+                    }
                 }
             });
             let multibrot = multibrot_handle.get_or_insert_with(|| {
