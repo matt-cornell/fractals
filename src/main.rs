@@ -3,7 +3,9 @@ use egui::Color32;
 use num_complex::{Complex64, ComplexFloat};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -11,9 +13,9 @@ use std::thread::Thread;
 use std::time::Duration;
 
 fn fractal_depth(
+    o: f64,
     mut z: Complex64,
     c: Complex64,
-    o: f64,
     p: Complex64,
     depth: usize,
 ) -> (usize, Complex64) {
@@ -42,13 +44,17 @@ struct Palette {
     palette: Vec<Color32>,
 }
 impl Palette {
-    pub fn bw() -> Self {
-        Self {
+    pub fn bw(depth: usize) -> Self {
+        let mut this = Self {
             edit: vec![(Color32::BLACK, 0.0), (Color32::WHITE, 1.0)],
             stops: vec![(Color32::BLACK, 0.0), (Color32::WHITE, 1.0)],
             exponential: false,
             palette: Vec::new(),
+        };
+        if depth > 0 {
+            this.regenerate(depth, false);
         }
+        this
     }
     pub fn regenerate(&mut self, depth: usize, sort: bool) {
         self.stops.clone_from(&self.edit);
@@ -307,6 +313,9 @@ enum PaletteSerde {
 struct AppState {
     exponent: f64,
     depth: usize,
+    #[serde(default)]
+    renorm: bool,
+    z: String,
     c: String,
     #[serde(rename = "P")]
     p: String,
@@ -315,10 +324,10 @@ struct AppState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ExportSelection {
-    Multibrot,
-    Phoenix,
-    Hyperjulia,
+enum FractalPlane {
+    Z,
+    C,
+    P,
 }
 
 struct ThreadWaker {
@@ -341,48 +350,343 @@ const READY: usize = SPECIAL_BASE;
 const WAITING: usize = SPECIAL_BASE + 1;
 const CANCELLING: usize = SPECIAL_BASE >> 1;
 
+struct ImageData {
+    resolution: usize,
+    buffer: Vec<Color32>,
+    handle: Option<egui::TextureHandle>,
+    changed: bool,
+    param: Complex64,
+    param_str: String,
+    invalid_param: bool,
+    save_fut: Option<Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>>,
+    save_res: Result<(), String>,
+    marker: bool,
+}
+impl ImageData {
+    fn parse_str(&mut self) {
+        if let Ok(p) = self.param_str.parse() {
+            self.param = p;
+            self.invalid_param = false;
+            if self.marker {
+                self.mark_changed();
+            }
+        } else {
+            self.invalid_param = true;
+        }
+    }
+    #[inline(always)]
+    fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+    fn update(
+        &mut self,
+        plane: FractalPlane,
+        common: &CommonData,
+        zcp: [Complex64; 3],
+        ctx: &egui::Context,
+    ) {
+        if !self.changed {
+            return;
+        }
+        self.changed = false;
+        render_fractal(
+            zcp,
+            plane,
+            self.marker.then_some(self.param),
+            self.resolution,
+            common,
+            &mut self.buffer,
+            None,
+        );
+        let img = egui::ColorImage {
+            size: [self.resolution; 2],
+            source_size: egui::Vec2::splat(self.resolution as f32),
+            pixels: self.buffer.clone(),
+        };
+        if let Some(handle) = &mut self.handle {
+            handle.set(img, egui::TextureOptions::NEAREST);
+        } else {
+            self.handle = Some(ctx.load_texture(
+                format!("{plane:?}-plane"),
+                img,
+                egui::TextureOptions::NEAREST,
+            ));
+        }
+    }
+    fn show(&mut self, label: &str, ui: &mut egui::Ui) -> bool {
+        let mut updated = false;
+        ui.horizontal(|ui| {
+            ui.label(format!("{label}: "));
+            ui.vertical(|ui| {
+                if ui
+                    .add(egui::TextEdit::singleline(&mut self.param_str).desired_width(50.0))
+                    .changed()
+                {
+                    self.parse_str();
+                    if !self.invalid_param {
+                        updated = true;
+                    }
+                }
+                if self.invalid_param {
+                    add_error(&"Invalid parameter", ui, None);
+                }
+            });
+            if ui.checkbox(&mut self.marker, "Show marker").changed() {
+                self.mark_changed();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                self.changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.resolution, 0..=4096)
+                            .clamping(egui::SliderClamping::Never)
+                            .logarithmic(true)
+                            .text("Resolution"),
+                    )
+                    .changed();
+            })
+        });
+        if let Err(err) = &self.save_res {
+            let mut clicked = false;
+            add_error(err, ui, Some(&mut || clicked = true));
+            if clicked {
+                self.save_res = Ok(());
+            }
+        }
+        let mut img = ui.image(self.handle.as_ref().unwrap());
+        if self.marker {
+            img = img.interact(egui::Sense::click_and_drag());
+            let scale = 4.0 / (self.resolution as f64);
+            if let Some(pos) = img.interact_pointer_pos() {
+                let p = pos - img.rect.min;
+                let x = p.x as f64 * scale - 2.0;
+                let y = p.y as f64 * scale - 2.0;
+                let res = self.resolution as f64;
+                self.param = Complex64::new((x * res).round() / res, (-y * res).round() / res);
+                self.param_str.clear();
+                let _ = write!(self.param_str, "{}", self.param);
+                self.mark_changed();
+                updated = true;
+            }
+        } else {
+            img.interact(egui::Sense::click()).context_menu(|ui| {
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_image(egui::ColorImage {
+                        size: [self.resolution; 2],
+                        source_size: egui::Vec2::splat(self.resolution as f32),
+                        pixels: self.buffer.clone(),
+                    });
+                }
+                if ui.button("Save").clicked() {
+                    self.save_fut = Some(Box::pin(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Images", &["png"])
+                            .set_file_name("fractal.png")
+                            .save_file(),
+                    ));
+                }
+            });
+        }
+        updated
+    }
+    fn poll_fut(&mut self, ctx: &egui::Context) {
+        if let Some(fut) = &mut self.save_fut {
+            if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            {
+                self.save_fut = None;
+                'save: {
+                    let Some(handle) = handle else {
+                        break 'save;
+                    };
+                    let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
+                        self.save_res = Err(format!("Failed to open file: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    let mut encoder =
+                        png::Encoder::new(file, self.resolution as _, self.resolution as _);
+                    encoder.set_color(png::ColorType::Rgba);
+                    let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
+                        self.save_res = Err(format!("Failed to save image: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&self.buffer)) {
+                        self.save_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                    if let Err(err) = writer.finish() {
+                        self.save_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+}
+impl Default for ImageData {
+    fn default() -> Self {
+        Self {
+            resolution: 256,
+            buffer: Vec::new(),
+            handle: None,
+            changed: true,
+            param: Complex64::ZERO,
+            param_str: Complex64::ZERO.to_string(),
+            invalid_param: false,
+            save_fut: None,
+            save_res: Ok(()),
+            marker: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CommonData {
+    exponent: f64,
+    depth: usize,
+    renorm: bool,
+    upper: Palette,
+    lower: Option<Palette>,
+}
+impl CommonData {
+    fn regenerate(&mut self, sort: bool) {
+        self.upper.regenerate(self.depth, sort);
+        if let Some(lower) = &mut self.lower {
+            lower.regenerate(self.depth, sort);
+        }
+    }
+}
+impl Default for CommonData {
+    fn default() -> Self {
+        Self {
+            exponent: 2.0,
+            depth: 100,
+            renorm: false,
+            upper: Palette::bw(100),
+            lower: None,
+        }
+    }
+}
+
+fn add_error(msg: &dyn ToString, ui: &mut egui::Ui, clickable: Option<&mut dyn FnMut()>) {
+    let visuals = &ui.style().visuals;
+    let base = egui::Label::new(
+        egui::RichText::new(msg.to_string())
+            .color(visuals.error_fg_color)
+            .background_color(visuals.extreme_bg_color),
+    );
+    if let Some(cb) = clickable {
+        if ui.add(base.sense(egui::Sense::click())).clicked() {
+            cb();
+        }
+    } else {
+        ui.add(base);
+    }
+}
+
+fn show_param(ui: &mut egui::Ui, name: &str, plane: &mut ImageData, others: [&mut ImageData; 2]) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{name}: "));
+        ui.vertical(|ui| {
+            if ui
+                .add(egui::TextEdit::singleline(&mut plane.param_str).desired_width(50.0))
+                .changed()
+            {
+                plane.parse_str();
+                if !plane.invalid_param {
+                    for p in others {
+                        p.mark_changed();
+                    }
+                }
+            }
+            if plane.invalid_param {
+                add_error(&"Invalid parameter", ui, None);
+            }
+        });
+    });
+}
+
+fn render_fractal(
+    [z, c, p]: [Complex64; 3],
+    plane: FractalPlane,
+    target: Option<Complex64>,
+    resolution: usize,
+    common: &CommonData,
+    buffer: &mut Vec<Color32>,
+    term: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> bool {
+    buffer.resize(resolution * resolution, Color32::PLACEHOLDER);
+    let scale = 4.0 / (resolution as f64);
+    let target = target.map(|t| {
+        (
+            ((t.re + 2.0) / scale) as usize,
+            ((-t.im + 2.0) / scale) as usize,
+        )
+    });
+    let work = |(n, px): (usize, &mut Color32)| {
+        let (y, x) = num_integer::div_rem(n, resolution);
+        if target.is_some_and(|(tx, ty)| {
+            (x == tx && y.abs_diff(ty) < 5) || (y == ty && x.abs_diff(tx) < 5)
+        }) {
+            *px = Color32::RED;
+        } else {
+            let x = x as f64 * scale - 2.0;
+            let y = y as f64 * scale - 2.0;
+            let v = Complex64::new(x, -y);
+            let (mut z, mut c, mut p) = (z, c, p);
+            match plane {
+                FractalPlane::Z => z = v,
+                FractalPlane::C => c = v,
+                FractalPlane::P => p = v,
+            }
+            let (d, z) = fractal_depth(common.exponent, z, c, p, common.depth);
+            let mut d = if common.renorm {
+                (((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln()) / std::f64::consts::LN_2)
+                    as usize
+            } else {
+                d
+            };
+            if d >= common.upper.palette.len() {
+                d = common.upper.palette.len() - 1;
+            }
+            let upper = common.upper.palette[d];
+            let color = if let Some(lower) = &common.lower {
+                upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
+            } else {
+                upper
+            };
+
+            *px = color;
+        }
+    };
+    if let Some(t) = term {
+        buffer.par_iter_mut().enumerate().any(|v| {
+            work(v);
+            t()
+        })
+    } else {
+        buffer.par_iter_mut().enumerate().for_each(work);
+        false
+    }
+}
+
 fn main() {
-    let mut multibrot_resolution = 256;
-    let mut phoenix_resolution = 256;
-    let mut hyperjulia_resolution = 512;
-    let mut c = Complex64::ZERO;
-    let mut exponent = 2.0;
-    let mut p = Complex64::ZERO;
-    let mut depth = 100usize;
+    let mut z = ImageData::default();
+    let mut c = ImageData::default();
+    let mut p = ImageData::default();
+    let mut common = CommonData::default();
     let mut integer_exp = true;
-    let mut show_marker = true;
-    let mut renorm = false;
-    let mut multibrot_buffer = Vec::new();
-    let mut hyperjulia_buffer = Vec::new();
-    let mut phoenix_buffer = Vec::new();
-    let mut multibrot_handle = None;
-    let mut hyperjulia_handle = None;
-    let mut phoenix_handle = None;
-    let mut update_multibrot = true;
-    let mut update_phoenix = true;
-    let mut update_hyperjulia = true;
-    let mut c_str = c.to_string();
-    let mut p_str = p.to_string();
-    let mut invalid_c = false;
-    let mut invalid_p = false;
-    let mut upper_palette = Palette::bw();
-    let mut lower_palette = None::<Palette>;
     let mut file_res = Ok::<_, String>(false);
     let mut edit_res = Ok::<_, String>(());
     let mut edit_buf = String::new();
-    upper_palette.regenerate(depth, false);
-    let mut export_sel = ExportSelection::Hyperjulia;
+    let mut export_sel = FractalPlane::Z;
     let mut export_size = 8192;
     let export_state = Arc::new(AtomicUsize::new(READY));
     let export_res = Arc::new(Mutex::new(Ok(())));
     let mut save_config = None;
     let mut load_config = None;
-    let mut save_brot = None;
-    let mut save_phoenix = None;
-    let mut save_julia = None;
-    let mut save_brot_res: Result<(), String> = Ok(());
-    let mut save_phoenix_res: Result<(), String> = Ok(());
-    let mut save_julia_res: Result<(), String> = Ok(());
     eframe::run_simple_native(
         "Hyperjulia",
         eframe::NativeOptions {
@@ -392,17 +696,19 @@ fn main() {
         },
         move |ctx, _| {
             egui::Window::new("Editor").show(ctx, |ui| {
-                if update_multibrot || update_hyperjulia {
+                if z.changed || c.changed || p.changed {
                     let res = serde_json::to_string_pretty(&AppState {
-                        exponent,
-                        depth,
-                        c: c_str.clone(),
-                        p: p_str.clone(),
-                        palette: Some(if let Some(lower) = &lower_palette {
+                        exponent: common.exponent,
+                        depth: common.depth,
+                        renorm: common.renorm,
+                        z: z.param_str.clone(),
+                        c: c.param_str.clone(),
+                        p: p.param_str.clone(),
+                        palette: Some(if let Some(lower) = &common.lower {
                             PaletteSerde::Split {
                                 upper: PaletteData {
-                                    exponential: upper_palette.exponential,
-                                    stops: upper_palette.stops.clone(),
+                                    exponential: common.upper.exponential,
+                                    stops: common.upper.stops.clone(),
                                 },
                                 lower: PaletteData {
                                     exponential: lower.exponential,
@@ -412,8 +718,8 @@ fn main() {
                         } else {
                             PaletteSerde::Single {
                                 palette: PaletteData {
-                                    exponential: upper_palette.exponential,
-                                    stops: upper_palette.stops.clone(),
+                                    exponential: common.upper.exponential,
+                                    stops: common.upper.stops.clone(),
                                 },
                             }
                         }),
@@ -443,18 +749,9 @@ fn main() {
                     Ok(ref mut ch) => force_changed = std::mem::take(ch),
                     Err(ref err) => {
                         force_changed = false;
-                        let visuals = &ui.style().visuals;
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!("Invalid data: {err}"))
-                                        .color(visuals.error_fg_color)
-                                        .background_color(visuals.extreme_bg_color),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .clicked()
-                        {
+                        let mut clicked = false;
+                        add_error(err, ui, Some(&mut || clicked = true));
+                        if clicked {
                             file_res = Ok(false);
                         }
                     }
@@ -471,41 +768,33 @@ fn main() {
                     match serde_json::from_str::<AppState>(&edit_buf) {
                         Ok(state) => {
                             edit_res = Ok(());
-                            exponent = state.exponent;
-                            if exponent % 1.0 != 0.0 {
+                            common.exponent = state.exponent;
+                            if common.exponent % 1.0 != 0.0 {
                                 integer_exp = false;
                             }
-                            depth = state.depth;
-                            c_str = state.c;
-                            p_str = state.p;
-                            update_multibrot = true;
-                            update_hyperjulia = true;
-                            update_phoenix = true;
-                            if let Ok(new_c) = c_str.parse() {
-                                c = new_c;
-                                invalid_c = false;
-                            } else {
-                                invalid_c = true;
-                            }
-                            if let Ok(new_p) = p_str.parse() {
-                                p = new_p;
-                                invalid_p = false;
-                            } else {
-                                invalid_p = true;
-                            }
+                            common.depth = state.depth;
+                            common.renorm = state.renorm;
+                            z.param_str = state.z;
+                            c.param_str = state.c;
+                            p.param_str = state.p;
+                            z.parse_str();
+                            c.parse_str();
+                            p.parse_str();
+                            z.mark_changed();
+                            c.mark_changed();
+                            p.mark_changed();
+                            let sort = state.palette.is_some();
                             if let Some(p) = state.palette {
                                 match p {
                                     PaletteSerde::Single { palette } => {
-                                        upper_palette.exponential = palette.exponential;
-                                        upper_palette.edit = palette.stops;
-                                        upper_palette.regenerate(depth, true);
-                                        lower_palette = None;
+                                        common.upper.exponential = palette.exponential;
+                                        common.upper.edit = palette.stops;
+                                        common.lower = None;
                                     }
                                     PaletteSerde::Split { upper, lower } => {
-                                        upper_palette.exponential = upper.exponential;
-                                        upper_palette.edit = upper.stops;
-                                        upper_palette.regenerate(depth, true);
-                                        let lower_palette = lower_palette.get_or_insert(Palette {
+                                        common.upper.exponential = upper.exponential;
+                                        common.upper.edit = upper.stops;
+                                        let lower_palette = common.lower.get_or_insert(Palette {
                                             edit: Vec::new(),
                                             stops: Vec::new(),
                                             exponential: false,
@@ -513,194 +802,102 @@ fn main() {
                                         });
                                         lower_palette.exponential = lower.exponential;
                                         lower_palette.edit = lower.stops;
-                                        lower_palette.regenerate(depth, true);
                                     }
                                 }
                             }
+                            common.regenerate(sort);
                         }
                         Err(err) => edit_res = Err(err.to_string()),
                     }
-                }
-            });
-            egui::Window::new("Display").show(ctx, |ui| {
-                if ui
-                    .add(
-                        egui::Slider::new(&mut multibrot_resolution, 10..=10000)
-                            .clamping(egui::SliderClamping::Never)
-                            .logarithmic(true)
-                            .text("Multibrot Resolution"),
-                    )
-                    .changed()
-                {
-                    update_multibrot = true;
-                }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut phoenix_resolution, 10..=10000)
-                            .clamping(egui::SliderClamping::Never)
-                            .logarithmic(true)
-                            .text("Phoenix Resolution"),
-                    )
-                    .changed()
-                {
-                    update_phoenix = true;
-                }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut hyperjulia_resolution, 10..=10000)
-                            .clamping(egui::SliderClamping::Never)
-                            .logarithmic(true)
-                            .text("Hyperjulia Resolution"),
-                    )
-                    .changed()
-                {
-                    update_hyperjulia = true;
-                }
-                if ui.checkbox(&mut show_marker, "Show Markers").changed() {
-                    update_multibrot = true;
-                    update_phoenix = true;
-                }
-                if ui.checkbox(&mut renorm, "Renorm Hyperjulia").changed() {
-                    update_hyperjulia = true;
                 }
             });
             egui::Window::new("Params").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .add(
-                            egui::Slider::new(&mut exponent, -5.0..=5.0)
+                            egui::Slider::new(&mut common.exponent, -5.0..=5.0)
                                 .max_decimals(if integer_exp { 0 } else { 2 })
                                 .text("Exponent"),
                         )
                         .changed()
                     {
-                        update_multibrot = true;
-                        update_hyperjulia = true;
-                        update_phoenix = true;
+                        z.mark_changed();
+                        c.mark_changed();
+                        p.mark_changed();
                     }
                     ui.checkbox(&mut integer_exp, "Integer");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("c: ");
-                    ui.vertical(|ui| {
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut c_str).desired_width(50.0))
-                            .changed()
-                        {
-                            if let Ok(new_c) = c_str.parse() {
-                                c = new_c;
-                                update_hyperjulia = true;
-                                if show_marker {
-                                    update_multibrot = true;
-                                }
-                                update_phoenix = true;
-                                invalid_c = false;
-                            } else {
-                                invalid_c = true;
-                            }
-                        }
-                        if invalid_c {
-                            let visuals = &ui.style().visuals;
-                            ui.label(
-                                egui::RichText::new("Invalid parameter")
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            );
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("P: ");
-                    ui.vertical(|ui| {
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut p_str).desired_width(50.0))
-                            .changed()
-                        {
-                            if let Ok(new_p) = p_str.parse() {
-                                p = new_p;
-                                update_multibrot = true;
-                                update_hyperjulia = true;
-                                if show_marker {
-                                    update_phoenix = true;
-                                }
-                                invalid_p = false;
-                            } else {
-                                invalid_p = true;
-                            }
-                        }
-                        if invalid_p {
-                            let visuals = &ui.style().visuals;
-                            ui.label(
-                                egui::RichText::new("Invalid parameter")
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            );
-                        }
-                    });
-                });
                 if ui
                     .add(
-                        egui::Slider::new(&mut depth, 1..=1000)
+                        egui::Slider::new(&mut common.depth, 1..=1000)
                             .logarithmic(true)
                             .text("Depth"),
                     )
                     .changed()
                 {
-                    upper_palette.regenerate(depth, false);
-                    if let Some(lower) = &mut lower_palette {
-                        lower.regenerate(depth, false);
+                    common.upper.regenerate(common.depth, false);
+                    if let Some(lower) = &mut common.lower {
+                        lower.regenerate(common.depth, false);
                     }
-                    update_multibrot = true;
-                    update_hyperjulia = true;
-                    update_phoenix = true;
+                    z.mark_changed();
+                    c.mark_changed();
+                    p.mark_changed();
                 }
+                show_param(ui, "z", &mut z, [&mut c, &mut p]);
+                show_param(ui, "c", &mut c, [&mut p, &mut z]);
+                show_param(ui, "P", &mut p, [&mut z, &mut c]);
             });
             egui::Window::new("Colors").show(ctx, |ui| {
-                let mut changed = egui::CollapsingHeader::new(if lower_palette.is_some() {
+                let renorm_box = ui.checkbox(&mut common.renorm, "Renormalize");
+                if renorm_box.hovered() {
+                    renorm_box.show_tooltip_text("Renormalization can help reduce banding in the images, but gives somewhat dimmer results. Try it to see the difference!");
+                }
+                let mut changed = renorm_box.changed();
+                let mut show_lower = common.lower.is_some();
+                let split_grad_box = ui.checkbox(&mut show_lower, "Split Gradient");
+                if split_grad_box.hovered() {
+                    split_grad_box.show_tooltip_text("Use a linear blend of upper and lower gradients rather than just one");
+                }
+                changed |= split_grad_box.changed();
+                changed |= egui::CollapsingHeader::new(if common.lower.is_some() {
                     "Upper"
                 } else {
                     "Gradient"
                 })
                 .id_salt("Upper")
-                .show(ui, |ui| show_picker(ui, &mut upper_palette))
+                .default_open(true)
+                .show(ui, |ui| show_picker(ui, &mut common.upper))
                 .body_returned
                 .unwrap_or(false);
-                let mut show_lower = lower_palette.is_some();
-                changed |= ui.checkbox(&mut show_lower, "Lower").changed();
                 if show_lower {
-                    let lower = lower_palette.get_or_insert_with(|| upper_palette.clone());
-                    changed |= ui
-                        .collapsing("Lower", |ui| show_picker(ui, lower))
+                    let lower = common.lower.get_or_insert_with(|| common.upper.clone());
+                    changed |= egui::CollapsingHeader::new("Lower")
+                        .default_open(true)
+                        .show(ui, |ui| show_picker(ui, lower))
                         .body_returned
                         .unwrap_or(false);
                 } else {
-                    lower_palette = None;
+                    common.lower = None;
                 }
                 if changed {
-                    upper_palette.regenerate(depth, true);
-                    if let Some(lower) = &mut lower_palette {
-                        lower.regenerate(depth, true);
-                    }
-                    update_multibrot = true;
-                    update_hyperjulia = true;
+                    common.regenerate(true);
+                    z.mark_changed();
+                    c.mark_changed();
+                    p.mark_changed();
                 }
             });
             egui::Window::new("Export").show(ctx, |ui| {
                 let state = export_state.load(Ordering::Acquire);
-                egui::ComboBox::new("Export Kind", "Fractal")
-                    .selected_text(format!("{export_sel:?}"))
+                egui::ComboBox::new("Fractal Plane", "Fractal")
+                    .selected_text(match export_sel {
+                        FractalPlane::Z => "z",
+                        FractalPlane::C => "c",
+                        FractalPlane::P => "P",
+                    })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut export_sel,
-                            ExportSelection::Multibrot,
-                            "Multibrot",
-                        );
-                        ui.selectable_value(&mut export_sel, ExportSelection::Phoenix, "Phoenix");
-                        ui.selectable_value(
-                            &mut export_sel,
-                            ExportSelection::Hyperjulia,
-                            "Hyperjulia",
-                        );
+                        ui.selectable_value(&mut export_sel, FractalPlane::Z, "z");
+                        ui.selectable_value(&mut export_sel, FractalPlane::C, "c");
+                        ui.selectable_value(&mut export_sel, FractalPlane::P, "P");
                     });
                 ui.add_enabled(
                     state == READY,
@@ -714,49 +911,23 @@ fn main() {
                         if ui.button("Export").clicked() {
                             *export_res.lock().unwrap() = Ok(());
                             let state = Arc::clone(&export_state);
-                            let upper_palette = upper_palette.clone();
-                            let lower_palette = lower_palette.clone();
+                            let common = common.clone();
                             let res = Arc::clone(&export_res);
+                            let zcp = [z.param, c.param, p.param];
                             std::thread::spawn(move || {
                                 state.store(0, Ordering::Release);
                                 let mut buffer =
                                     vec![Color32::PLACEHOLDER; export_size * export_size];
-                                let scale = 4.0 / (export_size as f64);
-                                let succ = buffer
-                                    .par_iter_mut()
-                                    .enumerate()
-                                    .map(|(n, px)| {
-                                        let (y, x) = num_integer::div_rem(n, export_size);
-                                        let x = x as f64 * scale - 2.0;
-                                        let y = y as f64 * scale - 2.0;
-                                        let (z, c, p) = match export_sel {
-                                            ExportSelection::Multibrot => {
-                                                (Complex64::ZERO, Complex64::new(x, -y), p)
-                                            }
-                                            ExportSelection::Phoenix => {
-                                                (Complex64::ZERO, c, Complex64::new(x, -y))
-                                            }
-                                            ExportSelection::Hyperjulia => {
-                                                (Complex64::new(x, -y), c, p)
-                                            }
-                                        };
-                                        let (d, _) = fractal_depth(z, c, exponent, p, depth);
-                                        let upper = upper_palette.palette[d];
-                                        let color = if let Some(lower) = &lower_palette {
-                                            upper.lerp_to_gamma(
-                                                lower.palette[d],
-                                                y.mul_add(0.25, 0.5) as _,
-                                            )
-                                        } else {
-                                            upper
-                                        };
-
-                                        *px = color;
-
-                                        state.fetch_add(1, Ordering::AcqRel) < CANCELLING
-                                    })
-                                    .all(|v| v);
-                                if !succ {
+                                let broke = render_fractal(
+                                    zcp,
+                                    export_sel,
+                                    None,
+                                    export_size,
+                                    &common,
+                                    &mut buffer,
+                                    Some(&|| state.fetch_add(1, Ordering::AcqRel) < CANCELLING),
+                                );
+                                if broke {
                                     state.store(READY, Ordering::Release);
                                     return;
                                 }
@@ -885,366 +1056,26 @@ fn main() {
                     }
                 }
             });
-            let multibrot = multibrot_handle.get_or_insert_with(|| {
-                ctx.load_texture(
-                    "multibrot",
-                    egui::ColorImage::example(),
-                    egui::TextureOptions::NEAREST,
-                )
-            });
-            let phoenix = phoenix_handle.get_or_insert_with(|| {
-                ctx.load_texture(
-                    "phoenix",
-                    egui::ColorImage::example(),
-                    egui::TextureOptions::NEAREST,
-                )
-            });
-            let hyperjulia = hyperjulia_handle.get_or_insert_with(|| {
-                ctx.load_texture(
-                    "hyperjulia",
-                    egui::ColorImage::example(),
-                    egui::TextureOptions::NEAREST,
-                )
-            });
-            if update_multibrot {
-                update_multibrot = false;
-                multibrot_buffer.resize(
-                    multibrot_resolution * multibrot_resolution,
-                    Color32::PLACEHOLDER,
-                );
-                let scale = 4.0 / (multibrot_resolution as f64);
-                let target = show_marker.then(|| {
-                    (
-                        ((c.re + 2.0) / scale) as usize,
-                        ((-c.im + 2.0) / scale) as usize,
-                    )
-                });
-                multibrot_buffer
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(n, px)| {
-                        let (y, x) = num_integer::div_rem(n, multibrot_resolution);
-                        if target.is_some_and(|(tx, ty)| {
-                            (x == tx && y.abs_diff(ty) < 5) || (y == ty && x.abs_diff(tx) < 5)
-                        }) {
-                            *px = Color32::RED;
-                        } else {
-                            let x = x as f64 * scale - 2.0;
-                            let y = y as f64 * scale - 2.0;
-                            let (d, _) = fractal_depth(
-                                Complex64::ZERO,
-                                Complex64::new(x, -y),
-                                exponent,
-                                p,
-                                depth,
-                            );
-                            let upper = upper_palette.palette[d];
-                            let color = if let Some(lower) = &lower_palette {
-                                upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
-                            } else {
-                                upper
-                            };
-
-                            *px = color;
-                        }
-                    });
-                multibrot.set(
-                    egui::ColorImage {
-                        size: [multibrot_resolution; 2],
-                        source_size: egui::Vec2::splat(multibrot_resolution as f32),
-                        pixels: multibrot_buffer.clone(),
-                    },
-                    egui::TextureOptions::NEAREST,
-                );
-            }
-            if update_phoenix {
-                update_phoenix = false;
-                phoenix_buffer.resize(
-                    multibrot_resolution * multibrot_resolution,
-                    Color32::PLACEHOLDER,
-                );
-                let scale = 4.0 / (phoenix_resolution as f64);
-                let target = show_marker.then(|| {
-                    (
-                        ((p.re + 2.0) / scale) as usize,
-                        ((-p.im + 2.0) / scale) as usize,
-                    )
-                });
-                phoenix_buffer
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(n, px)| {
-                        let (y, x) = num_integer::div_rem(n, phoenix_resolution);
-                        if target.is_some_and(|(tx, ty)| {
-                            (x == tx && y.abs_diff(ty) < 5) || (y == ty && x.abs_diff(tx) < 5)
-                        }) {
-                            *px = Color32::RED;
-                        } else {
-                            let x = x as f64 * scale - 2.0;
-                            let y = y as f64 * scale - 2.0;
-                            let (d, _) = fractal_depth(
-                                Complex64::ZERO,
-                                c,
-                                exponent,
-                                Complex64::new(x, -y),
-                                depth,
-                            );
-                            let upper = upper_palette.palette[d];
-                            let color = if let Some(lower) = &lower_palette {
-                                upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
-                            } else {
-                                upper
-                            };
-
-                            *px = color;
-                        }
-                    });
-                phoenix.set(
-                    egui::ColorImage {
-                        size: [phoenix_resolution; 2],
-                        source_size: egui::Vec2::splat(phoenix_resolution as f32),
-                        pixels: phoenix_buffer.clone(),
-                    },
-                    egui::TextureOptions::NEAREST,
-                );
-            }
-            if update_hyperjulia {
-                update_hyperjulia = false;
-                hyperjulia_buffer.resize(
-                    hyperjulia_resolution * hyperjulia_resolution,
-                    Color32::PLACEHOLDER,
-                );
-                let scale = 4.0 / (hyperjulia_resolution as f64);
-                hyperjulia_buffer
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(n, px)| {
-                        let (y, x) = num_integer::div_rem(n, hyperjulia_resolution);
-                        let x = x as f64 * scale - 2.0;
-                        let y = y as f64 * scale - 2.0;
-                        let z = Complex64::new(x, -y);
-                        let (d, z) = fractal_depth(z, c, exponent, p, depth);
-                        let mut d = if renorm {
-                            (((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln())
-                                / std::f64::consts::LN_2) as usize
-                        } else {
-                            d
-                        };
-                        if d >= upper_palette.palette.len() {
-                            d = upper_palette.palette.len();
-                        }
-                        let upper = upper_palette.palette[d];
-                        let color = if let Some(lower) = &lower_palette {
-                            upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
-                        } else {
-                            upper
-                        };
-                        *px = color;
-                    });
-                hyperjulia.set(
-                    egui::ColorImage {
-                        size: [hyperjulia_resolution; 2],
-                        source_size: egui::Vec2::splat(hyperjulia_resolution as f32),
-                        pixels: hyperjulia_buffer.clone(),
-                    },
-                    egui::TextureOptions::NEAREST,
-                )
-            }
-            egui::Window::new("Multibrot").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("c: ");
-                    ui.vertical(|ui| {
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut c_str).desired_width(50.0))
-                            .changed()
-                        {
-                            if let Ok(new_c) = c_str.parse() {
-                                c = new_c;
-                                update_hyperjulia = true;
-                                if show_marker {
-                                    update_multibrot = true;
-                                }
-                                update_phoenix = true;
-                                invalid_c = false;
-                            } else {
-                                invalid_c = true;
-                            }
-                        }
-                        if invalid_c {
-                            let visuals = &ui.style().visuals;
-                            ui.label(
-                                egui::RichText::new("Invalid parameter")
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            );
-                        }
-                    });
-                });
-                if let Err(err) = &save_brot_res {
-                    let visuals = &ui.style().visuals;
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(err)
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                    {
-                        save_brot_res = Ok(());
-                    }
-                }
-                let mut img = ui.image(&*multibrot);
-                if show_marker {
-                    img = img.interact(egui::Sense::click_and_drag());
-                    let scale = 4.0 / (multibrot_resolution as f64);
-                    if let Some(pos) = img.interact_pointer_pos() {
-                        let p = pos - img.rect.min;
-                        let x = p.x as f64 * scale - 2.0;
-                        let y = p.y as f64 * scale - 2.0;
-                        c = Complex64::new((x * 100.0).round() * 0.01, (y * 100.0).round() * -0.01);
-                        update_hyperjulia = true;
-                        update_multibrot = true;
-                        update_phoenix = true;
-                        c_str = c.to_string();
-                    }
-                } else {
-                    img.interact(egui::Sense::click()).context_menu(|ui| {
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_image(egui::ColorImage {
-                                size: [multibrot_resolution; 2],
-                                source_size: egui::Vec2::splat(multibrot_resolution as f32),
-                                pixels: multibrot_buffer.clone(),
-                            });
-                        }
-                        if ui.button("Save").clicked() {
-                            save_brot = Some(Box::pin(
-                                rfd::AsyncFileDialog::new()
-                                    .add_filter("Images", &["png"])
-                                    .set_file_name("multibrot.png")
-                                    .save_file(),
-                            ));
-                        }
-                    });
+            z.update(FractalPlane::Z, &common, [z.param, c.param, p.param], ctx);
+            c.update(FractalPlane::C, &common, [z.param, c.param, p.param], ctx);
+            p.update(FractalPlane::P, &common, [z.param, c.param, p.param], ctx);
+            egui::Window::new("Z-Plane").show(ctx, |ui| {
+                if z.show("z", ui) {
+                    c.mark_changed();
+                    p.mark_changed();
                 }
             });
-            egui::Window::new("Phoenix").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("P: ");
-                    ui.vertical(|ui| {
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut p_str).desired_width(50.0))
-                            .changed()
-                        {
-                            if let Ok(new_p) = p_str.parse() {
-                                p = new_p;
-                                update_hyperjulia = true;
-                                update_multibrot = true;
-                                if show_marker {
-                                    update_phoenix = true;
-                                }
-                                invalid_p = false;
-                            } else {
-                                invalid_p = true;
-                            }
-                        }
-                        if invalid_p {
-                            let visuals = &ui.style().visuals;
-                            ui.label(
-                                egui::RichText::new("Invalid parameter")
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            );
-                        }
-                    });
-                });
-                if let Err(err) = &save_phoenix_res {
-                    let visuals = &ui.style().visuals;
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(err)
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                    {
-                        save_phoenix_res = Ok(());
-                    }
-                }
-                let mut img = ui.image(&*phoenix);
-                if show_marker {
-                    img = img.interact(egui::Sense::click_and_drag());
-                    let scale = 4.0 / (phoenix_resolution as f64);
-                    if let Some(pos) = img.interact_pointer_pos() {
-                        let pos = pos - img.rect.min;
-                        let x = pos.x as f64 * scale - 2.0;
-                        let y = pos.y as f64 * scale - 2.0;
-                        p = Complex64::new((x * 100.0).round() * 0.01, (y * 100.0).round() * -0.01);
-                        update_hyperjulia = true;
-                        update_multibrot = true;
-                        update_phoenix = true;
-                        p_str = p.to_string();
-                    }
-                } else {
-                    img.interact(egui::Sense::click()).context_menu(|ui| {
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_image(egui::ColorImage {
-                                size: [phoenix_resolution; 2],
-                                source_size: egui::Vec2::splat(phoenix_resolution as f32),
-                                pixels: phoenix_buffer.clone(),
-                            });
-                        }
-                        if ui.button("Save").clicked() {
-                            save_phoenix = Some(Box::pin(
-                                rfd::AsyncFileDialog::new()
-                                    .add_filter("Images", &["png"])
-                                    .set_file_name("phoenix.png")
-                                    .save_file(),
-                            ));
-                        }
-                    });
+            egui::Window::new("C-Plane").show(ctx, |ui| {
+                if c.show("c", ui) {
+                    p.mark_changed();
+                    z.mark_changed();
                 }
             });
-            egui::Window::new("Hyperjulia").show(ctx, |ui| {
-                if let Err(err) = &save_julia_res {
-                    let visuals = &ui.style().visuals;
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(err)
-                                    .color(visuals.error_fg_color)
-                                    .background_color(visuals.extreme_bg_color),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                    {
-                        save_julia_res = Ok(());
-                    }
+            egui::Window::new("P-Plane").show(ctx, |ui| {
+                if p.show("P", ui) {
+                    z.mark_changed();
+                    c.mark_changed();
                 }
-                let img = ui.image(&*hyperjulia);
-                img.interact(egui::Sense::click()).context_menu(|ui| {
-                    if ui.button("Copy").clicked() {
-                        ui.ctx().copy_image(egui::ColorImage {
-                            size: [hyperjulia_resolution; 2],
-                            source_size: egui::Vec2::splat(hyperjulia_resolution as f32),
-                            pixels: hyperjulia_buffer.clone(),
-                        });
-                    }
-                    if ui.button("Save").clicked() {
-                        save_julia = Some(Box::pin(
-                            rfd::AsyncFileDialog::new()
-                                .add_filter("Images", &["png"])
-                                .set_file_name("hyperjulia.png")
-                                .save_file(),
-                        ));
-                    }
-                });
             });
             if let Some(fut) = &mut save_config {
                 if let Poll::Ready(handle) =
@@ -1280,126 +1111,9 @@ fn main() {
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
-            if let Some(fut) = &mut save_brot {
-                if let Poll::Ready(handle) =
-                    fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-                {
-                    save_brot = None;
-                    'save: {
-                        let Some(handle) = handle else {
-                            break 'save;
-                        };
-                        let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
-                            save_brot_res = Err(format!("Failed to open file: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        let mut encoder = png::Encoder::new(
-                            file,
-                            multibrot_resolution as _,
-                            multibrot_resolution as _,
-                        );
-                        encoder.set_color(png::ColorType::Rgba);
-                        let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
-                            save_brot_res = Err(format!("Failed to save image: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        if let Err(err) =
-                            writer.write_image_data(bytemuck::cast_slice(&multibrot_buffer))
-                        {
-                            save_brot_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                        if let Err(err) = writer.finish() {
-                            save_brot_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                    }
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(100));
-                }
-            }
-            if let Some(fut) = &mut save_phoenix {
-                if let Poll::Ready(handle) =
-                    fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-                {
-                    save_brot = None;
-                    'save: {
-                        let Some(handle) = handle else {
-                            break 'save;
-                        };
-                        let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
-                            save_phoenix_res = Err(format!("Failed to open file: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        let mut encoder = png::Encoder::new(
-                            file,
-                            phoenix_resolution as _,
-                            phoenix_resolution as _,
-                        );
-                        encoder.set_color(png::ColorType::Rgba);
-                        let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
-                            save_phoenix_res = Err(format!("Failed to save image: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        if let Err(err) =
-                            writer.write_image_data(bytemuck::cast_slice(&multibrot_buffer))
-                        {
-                            save_phoenix_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                        if let Err(err) = writer.finish() {
-                            save_phoenix_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                    }
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(100));
-                }
-            }
-            if let Some(fut) = &mut save_julia {
-                if let Poll::Ready(handle) =
-                    fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-                {
-                    save_julia = None;
-                    'save: {
-                        let Some(handle) = handle else {
-                            break 'save;
-                        };
-                        let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
-                            save_julia_res = Err(format!("Failed to open file: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        let mut encoder = png::Encoder::new(
-                            file,
-                            hyperjulia_resolution as _,
-                            hyperjulia_resolution as _,
-                        );
-                        encoder.set_color(png::ColorType::Rgba);
-                        let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
-                            save_julia_res = Err(format!("Failed to save image: {err}"))
-                        }) else {
-                            break 'save;
-                        };
-                        if let Err(err) =
-                            writer.write_image_data(bytemuck::cast_slice(&hyperjulia_buffer))
-                        {
-                            save_julia_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                        if let Err(err) = writer.finish() {
-                            save_julia_res = Err(format!("Failed to save image: {err}"));
-                            break 'save;
-                        }
-                    }
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(100));
-                }
-            }
+            z.poll_fut(ctx);
+            c.poll_fut(ctx);
+            p.poll_fut(ctx);
         },
     )
     .unwrap();
