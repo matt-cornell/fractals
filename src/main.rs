@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
+use std::time::Duration;
 
 fn fractal_depth(
     mut z: Complex64,
@@ -790,9 +791,7 @@ fn main() {
                                     }
                                     let n = waker_handle.notified.swap(false, Ordering::AcqRel);
                                     if !n {
-                                        std::thread::park_timeout(
-                                            std::time::Duration::from_millis(100),
-                                        );
+                                        std::thread::park_timeout(Duration::from_millis(100));
                                     }
                                 }
                                 let Some(handle) = handle else {
@@ -1259,6 +1258,8 @@ fn main() {
                             file_res = Ok(false);
                         }
                     }
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
             if let Some(fut) = &mut load_config {
@@ -1275,6 +1276,8 @@ fn main() {
                             Err(err) => file_res = Err(format!("Failed to load config: {err}")),
                         }
                     }
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
             if let Some(fut) = &mut save_brot {
@@ -1313,6 +1316,8 @@ fn main() {
                             break 'save;
                         }
                     }
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
             if let Some(fut) = &mut save_phoenix {
@@ -1351,6 +1356,8 @@ fn main() {
                             break 'save;
                         }
                     }
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
             if let Some(fut) = &mut save_julia {
@@ -1389,6 +1396,8 @@ fn main() {
                             break 'save;
                         }
                     }
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
             }
         },
