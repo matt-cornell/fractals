@@ -490,7 +490,8 @@ fn main() {
             egui::Window::new("Display").show(ctx, |ui| {
                 if ui
                     .add(
-                        egui::Slider::new(&mut multibrot_resolution, 10..=1000)
+                        egui::Slider::new(&mut multibrot_resolution, 10..=10000)
+                            .clamping(egui::SliderClamping::Never)
                             .logarithmic(true)
                             .text("Multibrot Resolution"),
                     )
@@ -500,7 +501,8 @@ fn main() {
                 }
                 if ui
                     .add(
-                        egui::Slider::new(&mut phoenix_resolution, 10..=1000)
+                        egui::Slider::new(&mut phoenix_resolution, 10..=10000)
+                            .clamping(egui::SliderClamping::Never)
                             .logarithmic(true)
                             .text("Phoenix Resolution"),
                     )
@@ -510,7 +512,8 @@ fn main() {
                 }
                 if ui
                     .add(
-                        egui::Slider::new(&mut hyperjulia_resolution, 10..=1000)
+                        egui::Slider::new(&mut hyperjulia_resolution, 10..=10000)
+                            .clamping(egui::SliderClamping::Never)
                             .logarithmic(true)
                             .text("Hyperjulia Resolution"),
                     )
@@ -520,6 +523,7 @@ fn main() {
                 }
                 if ui.checkbox(&mut show_marker, "Show Markers").changed() {
                     update_multibrot = true;
+                    update_phoenix = true;
                 }
                 if ui.checkbox(&mut renorm, "Renorm Hyperjulia").changed() {
                     update_hyperjulia = true;
@@ -712,6 +716,7 @@ fn main() {
                 multibrot.set(
                     egui::ColorImage {
                         size: [multibrot_resolution; 2],
+                        source_size: egui::Vec2::splat(multibrot_resolution as f32),
                         pixels: multibrot_buffer.clone(),
                     },
                     egui::TextureOptions::NEAREST,
@@ -762,6 +767,7 @@ fn main() {
                 phoenix.set(
                     egui::ColorImage {
                         size: [phoenix_resolution; 2],
+                        source_size: egui::Vec2::splat(phoenix_resolution as f32),
                         pixels: phoenix_buffer.clone(),
                     },
                     egui::TextureOptions::NEAREST,
@@ -803,6 +809,7 @@ fn main() {
                 hyperjulia.set(
                     egui::ColorImage {
                         size: [hyperjulia_resolution; 2],
+                        source_size: egui::Vec2::splat(hyperjulia_resolution as f32),
                         pixels: hyperjulia_buffer.clone(),
                     },
                     egui::TextureOptions::NEAREST,
@@ -869,7 +876,14 @@ fn main() {
                         c_str = c.to_string();
                     }
                 } else {
-                    img.context_menu(|ui| {
+                    img.interact(egui::Sense::click()).context_menu(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_image(egui::ColorImage {
+                                size: [multibrot_resolution; 2],
+                                source_size: egui::Vec2::splat(multibrot_resolution as f32),
+                                pixels: multibrot_buffer.clone(),
+                            });
+                        }
                         if ui.button("Save").clicked() {
                             save_brot = Some(Box::pin(
                                 rfd::AsyncFileDialog::new()
@@ -942,7 +956,14 @@ fn main() {
                         p_str = p.to_string();
                     }
                 } else {
-                    img.context_menu(|ui| {
+                    img.interact(egui::Sense::click()).context_menu(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_image(egui::ColorImage {
+                                size: [phoenix_resolution; 2],
+                                source_size: egui::Vec2::splat(phoenix_resolution as f32),
+                                pixels: phoenix_buffer.clone(),
+                            });
+                        }
                         if ui.button("Save").clicked() {
                             save_phoenix = Some(Box::pin(
                                 rfd::AsyncFileDialog::new()
@@ -972,7 +993,14 @@ fn main() {
                     }
                 }
                 let img = ui.image(&*hyperjulia);
-                img.context_menu(|ui| {
+                img.interact(egui::Sense::click()).context_menu(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_image(egui::ColorImage {
+                            size: [hyperjulia_resolution; 2],
+                            source_size: egui::Vec2::splat(hyperjulia_resolution as f32),
+                            pixels: hyperjulia_buffer.clone(),
+                        });
+                    }
                     if ui.button("Save").clicked() {
                         save_julia = Some(Box::pin(
                             rfd::AsyncFileDialog::new()
