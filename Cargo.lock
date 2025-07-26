@@ -1099,6 +1099,7 @@ dependencies = [
  "num-complex",
  "num-integer",
  "png",
+ "pollster",
  "rayon",
  "rfd",
  "serde",

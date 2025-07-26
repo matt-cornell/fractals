@@ -12,6 +12,7 @@ futures-lite = "2.6.0"
 num-complex = "0.4.6"
 num-integer = "0.1.46"
 png = "0.17.16"
+pollster = "0.4.0"
 rayon = "1.10.0"
 rfd = "0.15.4"
 serde = { version = "1.0.219", features = ["derive"] }
