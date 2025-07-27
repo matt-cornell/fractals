@@ -4,46 +4,68 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+enum TextureKind {
+    Glow(glow::Texture),
+    Egui(egui::TextureId),
+}
+impl TextureKind {
+    fn resolve(&mut self, frame: &mut eframe::Frame) -> egui::TextureId {
+        match self {
+            Self::Glow(tex) => {
+                let tex = frame.register_native_glow_texture(*tex);
+                *self = Self::Egui(tex);
+                tex
+            }
+            Self::Egui(tex) => *tex,
+        }
+    }
+}
+
 pub struct ImageData {
     resolution: usize,
-    buffer: Vec<Color32>,
-    handle: egui::TextureHandle,
     changed: bool,
-    param: Complex64,
+    param: Complex32,
     pub param_str: String,
     invalid_param: bool,
     save_fut: Option<(Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>, bool)>,
     save_res: Result<(), String>,
     marker: bool,
+    realloc: Option<usize>,
+    framebuffer: glow::Framebuffer,
+    texture: TextureKind,
 }
 impl ImageData {
-    pub fn new(handle: egui::TextureHandle) -> Self {
-        Self {
-            handle,
+    pub fn new(gl: &gl::GlState) -> Result<Self, String> {
+        let texture = gl.texture(256)?;
+        let framebuffer;
+        unsafe {
+            framebuffer = gl.gl().create_framebuffer()?;
+            gl.attach_texture(texture, framebuffer, true)?;
+        }
+        Ok(Self {
             resolution: 256,
-            buffer: Vec::new(),
             changed: true,
-            param: Complex64::ZERO,
-            param_str: Complex64::ZERO.to_string(),
+            param: Complex32::ZERO,
+            param_str: Complex32::ZERO.to_string(),
             invalid_param: false,
             save_fut: None,
             save_res: Ok(()),
             marker: true,
-        }
+            realloc: None,
+            framebuffer,
+            texture: TextureKind::Glow(texture),
+        })
     }
     pub fn parse_str(&mut self) {
         if let Ok(p) = self.param_str.parse() {
             self.param = p;
             self.invalid_param = false;
-            if self.marker {
-                self.mark_changed();
-            }
         } else {
             self.invalid_param = true;
         }
     }
     #[inline(always)]
-    pub fn param(&self) -> Complex64 {
+    pub fn param(&self) -> Complex32 {
         self.param
     }
     #[inline(always)]
@@ -52,39 +74,81 @@ impl ImageData {
     }
     #[inline(always)]
     pub fn changed(&self) -> bool {
-        self.changed
+        self.changed || self.realloc.is_some()
     }
     #[inline(always)]
     pub fn invalid_param(&self) -> bool {
         self.invalid_param
     }
-    pub fn update(&mut self, plane: FractalPlane, common: &CommonData, zcp: [Complex64; 3]) {
+    fn frame_data(&self, gl: &Arc<glow::Context>) -> egui::ColorImage {
+        unsafe {
+            let res = self.realloc.unwrap_or(self.resolution);
+            let mut buffer = vec![Color32::PLACEHOLDER; res * res];
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+            gl.read_buffer(glow::COLOR_ATTACHMENT0);
+            gl.read_pixels(
+                0,
+                0,
+                res as _,
+                res as _,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(bytemuck::cast_slice_mut(&mut buffer))),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            egui::ColorImage {
+                size: [self.resolution; 2],
+                source_size: egui::Vec2::splat(self.resolution as f32),
+                pixels: buffer,
+            }
+        }
+    }
+    pub fn update(
+        &mut self,
+        plane: FractalPlane,
+        gl: &gl::GlState,
+        common: &CommonData,
+        zcp: [Complex32; 3],
+        ctx: &egui::Context,
+    ) {
+        if let Some(old) = self.realloc.take() {
+            if let Ok(texture) = gl.texture(self.resolution) {
+                if gl.attach_texture(texture, self.framebuffer, false).is_ok() {
+                    unsafe {
+                        match self.texture {
+                            TextureKind::Glow(tex) => gl.gl().delete_texture(tex),
+                            TextureKind::Egui(tex) => ctx.tex_manager().write().free(tex),
+                        }
+                    }
+                    self.texture = TextureKind::Glow(texture);
+                    self.changed = true;
+                } else {
+                    unsafe {
+                        gl.gl().delete_texture(texture);
+                    }
+                }
+            } else {
+                self.resolution = old;
+            }
+        }
         if !self.changed {
             return;
         }
         self.changed = false;
-        render_fractal(
+        gl.render(
+            common,
+            self.framebuffer,
             zcp,
             plane,
-            self.marker.then_some(self.param),
+            [0, 0, self.resolution as _, self.resolution as i32],
             self.resolution,
-            common,
-            &mut self.buffer,
-            None,
         );
-        let img = egui::ColorImage {
-            size: [self.resolution; 2],
-            source_size: egui::Vec2::splat(self.resolution as f32),
-            pixels: self.buffer.clone(),
-        };
-        self.handle.set(img, egui::TextureOptions::NEAREST);
     }
     pub fn show(
         &mut self,
         plane: FractalPlane,
-        common: &CommonData,
-        zcp: [Complex64; 3],
         ui: &mut egui::Ui,
+        frame: &mut eframe::Frame,
     ) -> bool {
         let mut updated = false;
         ui.horizontal(|ui| {
@@ -103,11 +167,19 @@ impl ImageData {
                     add_error(&"Invalid parameter", ui, None);
                 }
             });
+            if ui.button("Zero").clicked() {
+                self.param = Complex32::ZERO;
+                self.param_str.clear();
+                let _ = write!(self.param_str, "{}", self.param);
+                self.mark_changed();
+                updated = true;
+            }
             if ui.checkbox(&mut self.marker, "Show marker").changed() {
                 self.mark_changed();
             }
         });
-        self.changed |= ui
+        let old = self.resolution;
+        let new_res = ui
             .add(
                 egui::Slider::new(&mut self.resolution, 0..=4096)
                     .clamping(egui::SliderClamping::Never)
@@ -115,6 +187,10 @@ impl ImageData {
                     .text("Resolution"),
             )
             .changed();
+        if new_res {
+            self.realloc = self.realloc.or(Some(old));
+            self.mark_changed();
+        }
         if let Err(err) = &self.save_res {
             let mut clicked = false;
             add_error(err, ui, Some(&mut || clicked = true));
@@ -122,37 +198,52 @@ impl ImageData {
                 self.save_res = Ok(());
             }
         }
-        let mut img = ui.image(&self.handle).interact(egui::Sense::drag());
+        let mut img = egui::ScrollArea::both()
+            .show(ui, |ui| {
+                ui.image(egui::load::SizedTexture::new(
+                    self.texture.resolve(frame),
+                    [self.resolution as f32; 2],
+                ))
+                .interact(egui::Sense::click())
+            })
+            .inner;
         if self.marker {
             img = img.interact(egui::Sense::click_and_drag());
+            let scale = 4.0 / (self.resolution as f32);
             if img.clicked_by(egui::PointerButton::Primary)
                 || img.dragged_by(egui::PointerButton::Primary)
             {
-                let scale = 4.0 / (self.resolution as f64);
                 if let Some(pos) = img.interact_pointer_pos() {
                     let p = pos - img.rect.min;
-                    let x = p.x as f64 * scale - 2.0;
-                    let y = p.y as f64 * scale - 2.0;
-                    let res = self.resolution as f64;
-                    self.param = Complex64::new((x * res).round() / res, (-y * res).round() / res);
+                    let x = p.x * scale - 2.0;
+                    let y = p.y * scale - 2.0;
+                    let res = self.resolution as f32;
+                    self.param = Complex32::new((x * res).round() / res, (-y * res).round() / res);
                     self.param_str.clear();
                     let _ = write!(self.param_str, "{}", self.param);
                     self.mark_changed();
                     updated = true;
                 }
             }
+            let (tx, ty) = (
+                ((self.param.re + 2.0) / scale) as usize,
+                ((-self.param.im + 2.0) / scale) as usize,
+            );
+            let painter = ui.painter_at(img.rect);
+            painter.vline(
+                tx as f32 + img.rect.min.x,
+                (ty as f32 - 5.0 + img.rect.min.y)..=(ty as f32 + 5.0 + img.rect.min.y),
+                (1.0, Color32::RED),
+            );
+            painter.hline(
+                (tx as f32 - 5.0 + img.rect.min.x)..=(tx as f32 + 5.0 + img.rect.min.x),
+                ty as f32 + img.rect.min.y,
+                (1.0, Color32::RED),
+            );
         }
         img.context_menu(|ui| {
             if ui.button("Copy").clicked() {
-                let mut buffer = self.buffer.clone();
-                if self.marker {
-                    remove_marker(zcp, plane, self.param, self.resolution, common, &mut buffer);
-                }
-                ui.ctx().copy_image(egui::ColorImage {
-                    size: [self.resolution; 2],
-                    source_size: egui::Vec2::splat(self.resolution as f32),
-                    pixels: buffer,
-                });
+                ui.ctx().copy_image(self.frame_data(frame.gl().unwrap()));
             }
             if ui.button("Save").clicked() {
                 self.save_fut = Some((
@@ -166,15 +257,9 @@ impl ImageData {
                 ));
             }
             if ui.button("Copy with marker").clicked() {
-                let mut buffer = self.buffer.clone();
-                if !self.marker {
-                    add_marker(self.param, self.resolution, &mut buffer);
-                }
-                ui.ctx().copy_image(egui::ColorImage {
-                    size: [self.resolution; 2],
-                    source_size: egui::Vec2::splat(self.resolution as f32),
-                    pixels: buffer,
-                });
+                let mut img = self.frame_data(frame.gl().unwrap());
+                add_marker(self.param, self.resolution, &mut img.pixels);
+                ui.ctx().copy_image(img);
             }
             if ui.button("Save with marker").clicked() {
                 self.save_fut = Some((
@@ -190,12 +275,7 @@ impl ImageData {
         });
         updated
     }
-    pub fn poll_fut(
-        &mut self,
-        plane: FractalPlane,
-        common: &CommonData,
-        zcp: [Complex64; 3],
-    ) -> bool {
+    pub fn poll_fut(&mut self, gl: &Arc<glow::Context>) -> bool {
         if let Some((fut, marker)) = &mut self.save_fut {
             let marker = *marker;
             if let Poll::Ready(handle) = fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
@@ -218,26 +298,11 @@ impl ImageData {
                     }) else {
                         break 'save;
                     };
-                    let mut buffer = Vec::new();
-                    let pixels = if self.marker != marker {
-                        buffer.clone_from(&self.buffer);
-                        if self.marker {
-                            remove_marker(
-                                zcp,
-                                plane,
-                                self.param,
-                                self.resolution,
-                                common,
-                                &mut buffer,
-                            );
-                        } else {
-                            add_marker(self.param, self.resolution, &mut buffer);
-                        }
-                        &buffer
-                    } else {
-                        &self.buffer
-                    };
-                    if let Err(err) = writer.write_image_data(bytemuck::cast_slice(pixels)) {
+                    let mut buffer = self.frame_data(gl).pixels;
+                    if marker {
+                        add_marker(self.param, self.resolution, &mut buffer);
+                    }
+                    if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buffer)) {
                         self.save_res = Err(format!("Failed to save image: {err}"));
                         break 'save;
                     }
@@ -256,129 +321,8 @@ impl ImageData {
     }
 }
 
-pub fn render_fractal(
-    [z, c, p]: [Complex64; 3],
-    plane: FractalPlane,
-    target: Option<Complex64>,
-    resolution: usize,
-    common: &CommonData,
-    buffer: &mut Vec<Color32>,
-    term: Option<&(dyn Fn() -> bool + Send + Sync)>,
-) -> bool {
-    buffer.resize(resolution * resolution, Color32::PLACEHOLDER);
-    let scale = 4.0 / (resolution as f64);
-    let target = target.map(|t| {
-        (
-            ((t.re + 2.0) / scale) as usize,
-            ((-t.im + 2.0) / scale) as usize,
-        )
-    });
-    let work = |(n, px): (usize, &mut Color32)| {
-        let (y, x) = num_integer::div_rem(n, resolution);
-        if target.is_some_and(|(tx, ty)| {
-            (x == tx && y.abs_diff(ty) < 5) || (y == ty && x.abs_diff(tx) < 5)
-        }) {
-            *px = Color32::RED;
-        } else {
-            let x = x as f64 * scale - 2.0;
-            let y = y as f64 * scale - 2.0;
-            let v = Complex64::new(x, -y);
-            let (mut z, mut c, mut p) = (z, c, p);
-            match plane {
-                FractalPlane::Z => z = v,
-                FractalPlane::C => c = v,
-                FractalPlane::P => p = v,
-            }
-            let (d, z) = fractal_depth(common.exponent, z, c, p, common.depth);
-            let mut d = if common.renorm {
-                (((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln()) / std::f64::consts::LN_2)
-                    as usize
-            } else {
-                d
-            };
-            if d >= common.upper.palette.len() {
-                d = common.upper.palette.len() - 1;
-            }
-            let upper = common.upper.palette[d];
-            let color = if let Some(lower) = &common.lower {
-                upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
-            } else {
-                upper
-            };
-
-            *px = color;
-        }
-    };
-    if let Some(t) = term {
-        buffer.par_iter_mut().enumerate().any(|v| {
-            work(v);
-            t()
-        })
-    } else {
-        buffer.par_iter_mut().enumerate().for_each(work);
-        false
-    }
-}
-
-fn remove_marker(
-    [z, c, p]: [Complex64; 3],
-    plane: FractalPlane,
-    target: Complex64,
-    resolution: usize,
-    common: &CommonData,
-    buffer: &mut Vec<Color32>,
-) {
-    let scale = 4.0 / (resolution as f64);
-    let (tx, ty) = (
-        ((target.re + 2.0) / scale) as usize,
-        ((-target.im + 2.0) / scale) as usize,
-    );
-    let mut fill_px = |x: usize, y: usize| {
-        let idx = y * resolution + x;
-        let x = x as f64 * scale - 2.0;
-        let y = y as f64 * scale - 2.0;
-        let v = Complex64::new(x, -y);
-        let (mut z, mut c, mut p) = (z, c, p);
-        match plane {
-            FractalPlane::Z => z = v,
-            FractalPlane::C => c = v,
-            FractalPlane::P => p = v,
-        }
-        let (d, z) = fractal_depth(common.exponent, z, c, p, common.depth);
-        let mut d = if common.renorm {
-            (((d + 1) as f64 - z.abs().max(1.0).ln().max(1.0).ln()) / std::f64::consts::LN_2)
-                as usize
-        } else {
-            d
-        };
-        if d >= common.upper.palette.len() {
-            d = common.upper.palette.len() - 1;
-        }
-        let upper = common.upper.palette[d];
-        let color = if let Some(lower) = &common.lower {
-            upper.lerp_to_gamma(lower.palette[d], y.mul_add(0.25, 0.5) as _)
-        } else {
-            upper
-        };
-
-        buffer[idx] = color;
-    };
-    let xmin = tx.saturating_sub(5);
-    let xmax = tx.saturating_add(5).min(resolution - 1);
-    let ymin = ty.saturating_sub(5);
-    let ymax = ty.saturating_add(5).min(resolution - 1);
-    for x in xmin..=xmax {
-        fill_px(x, ty);
-    }
-    for y in ymin..=ymax {
-        if y != ty {
-            fill_px(tx, y);
-        }
-    }
-}
-
-fn add_marker(target: Complex64, resolution: usize, buffer: &mut Vec<Color32>) {
-    let scale = 4.0 / (resolution as f64);
+fn add_marker(target: Complex32, resolution: usize, buffer: &mut Vec<Color32>) {
+    let scale = 4.0 / (resolution as f32);
     let (tx, ty) = (
         ((target.re + 2.0) / scale) as usize,
         ((-target.im + 2.0) / scale) as usize,
@@ -391,28 +335,4 @@ fn add_marker(target: Complex64, resolution: usize, buffer: &mut Vec<Color32>) {
     for y in ymin..=ymax {
         buffer[y * resolution + tx] = Color32::RED;
     }
-}
-
-fn fractal_depth(
-    o: f64,
-    mut z: Complex64,
-    c: Complex64,
-    p: Complex64,
-    depth: usize,
-) -> (usize, Complex64) {
-    let mut last = Complex64::ZERO;
-    let bound = if o < 0.0 {
-        2.0 * std::f64::consts::SQRT_2
-    } else {
-        2.0
-    };
-    for i in 0..depth {
-        if z.abs() > bound {
-            return (i, z);
-        }
-        let old_z = z;
-        z = z.powf(o) + p * last + c;
-        last = old_z;
-    }
-    (depth, z)
 }

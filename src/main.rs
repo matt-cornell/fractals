@@ -1,13 +1,16 @@
 #![allow(clippy::type_complexity, clippy::ptr_arg)]
+#![windows_subsystem = "windows"]
 
 use eframe::egui;
 use egui::Color32;
-use num_complex::{Complex64, ComplexFloat};
-use rayon::prelude::*;
+use glow::HasContext;
+use num_complex::Complex32;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod editor;
 mod export;
+mod gl;
 mod math;
 mod plane;
 
@@ -24,52 +27,20 @@ struct Palette {
     edit: Vec<(Color32, f32)>,
     stops: Vec<(Color32, f32)>,
     exponential: bool,
-    palette: Vec<Color32>,
 }
 impl Palette {
-    pub fn bw(depth: usize) -> Self {
-        let mut this = Self {
+    fn bw() -> Self {
+        Self {
             edit: vec![(Color32::BLACK, 0.0), (Color32::WHITE, 1.0)],
             stops: vec![(Color32::BLACK, 0.0), (Color32::WHITE, 1.0)],
             exponential: false,
-            palette: Vec::new(),
-        };
-        if depth > 0 {
-            this.regenerate(depth, false);
         }
-        this
     }
-    pub fn regenerate(&mut self, depth: usize, sort: bool) {
+    fn update(&mut self) {
         self.stops.clone_from(&self.edit);
-        self.palette.clear();
-        self.palette.reserve(depth + 1);
-        if sort {
-            self.stops.sort_by(|a, b| a.1.total_cmp(&b.1));
-        }
-        for i in 0..=depth {
-            let d = if self.exponential {
-                1.0 - 0.5f32.powf(i as f32 / depth as f32)
-            } else {
-                i as f32 / depth as f32
-            };
-            let idx = self.stops.binary_search_by(|(_, k)| k.total_cmp(&d));
-            match idx {
-                Ok(idx) => self.palette.push(self.stops[idx].0),
-                Err(idx) => {
-                    if idx == 0 {
-                        self.palette.push(self.stops[0].0);
-                    } else if idx == self.stops.len() {
-                        self.palette.push(self.stops[self.stops.len() - 1].0);
-                    } else {
-                        let (a, ka) = self.stops[idx - 1];
-                        let (b, kb) = self.stops[idx];
-                        self.palette.push(a.lerp_to_gamma(b, (d - ka) / (kb - ka)));
-                    }
-                }
-            }
-        }
+        self.stops.sort_by(|a, b| a.1.total_cmp(&b.1));
     }
-    pub fn respace(&mut self) {
+    fn respace(&mut self) {
         self.edit.sort_by(|a, b| a.1.total_cmp(&b.1));
         let step = ((self.edit.len() - 1) as f32).recip();
         let mut val = 0.0;
@@ -115,7 +86,10 @@ fn show_picker(ui: &mut egui::Ui, palette: &mut Palette) -> bool {
             true
         }
     });
-    if ui.button("Add Stop").clicked() {
+    if ui
+        .add_enabled(palette.edit.len() < 16, egui::Button::new("Add stop"))
+        .clicked()
+    {
         palette.edit.push((Color32::WHITE, 1.0));
         changed = true;
     }
@@ -123,6 +97,7 @@ fn show_picker(ui: &mut egui::Ui, palette: &mut Palette) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
 enum FractalPlane {
     Z,
     C,
@@ -155,17 +130,18 @@ impl FractalPlane {
 
 #[derive(Clone)]
 struct CommonData {
-    exponent: f64,
+    exponent: f32,
+    boundary: f32,
     depth: usize,
     renorm: bool,
     upper: Palette,
     lower: Option<Palette>,
 }
 impl CommonData {
-    fn regenerate(&mut self, sort: bool) {
-        self.upper.regenerate(self.depth, sort);
+    fn update_palettes(&mut self) {
+        self.upper.update();
         if let Some(lower) = &mut self.lower {
-            lower.regenerate(self.depth, sort);
+            lower.update();
         }
     }
 }
@@ -173,9 +149,10 @@ impl Default for CommonData {
     fn default() -> Self {
         Self {
             exponent: 2.0,
+            boundary: 2.0,
             depth: 100,
             renorm: false,
-            upper: Palette::bw(100),
+            upper: Palette::bw(),
             lower: None,
         }
     }
@@ -235,49 +212,42 @@ struct App {
     edit: editor::EditorState,
     export: export::ExportState,
     integer_exp: bool,
+    gl: gl::GlState,
 }
 impl App {
-    pub fn new(cc: &eframe::CreationContext) -> Self {
-        Self {
+    pub fn new(cc: &eframe::CreationContext) -> Result<Self, String> {
+        let gl = gl::GlState::new(cc)?;
+        Ok(Self {
             common: CommonData::default(),
-            z: plane::ImageData::new(cc.egui_ctx.load_texture(
-                "Z-Plane",
-                egui::ColorImage::example(),
-                egui::TextureOptions::NEAREST,
-            )),
-            c: plane::ImageData::new(cc.egui_ctx.load_texture(
-                "C-Plane",
-                egui::ColorImage::example(),
-                egui::TextureOptions::NEAREST,
-            )),
-            p: plane::ImageData::new(cc.egui_ctx.load_texture(
-                "P-Plane",
-                egui::ColorImage::example(),
-                egui::TextureOptions::NEAREST,
-            )),
+            z: plane::ImageData::new(&gl)?,
+            c: plane::ImageData::new(&gl)?,
+            p: plane::ImageData::new(&gl)?,
             integer_exp: true,
             edit: editor::EditorState::default(),
             export: export::ExportState::default(),
-        }
+            gl,
+        })
     }
     #[inline(always)]
-    fn zcp(&self) -> [Complex64; 3] {
+    fn zcp(&self) -> [Complex32; 3] {
         [self.z.param(), self.c.param(), self.p.param()]
     }
-    fn update(&mut self) {
+    fn update(&mut self, ctx: &egui::Context) {
         let zcp = self.zcp();
-        self.z.update(FractalPlane::Z, &self.common, zcp);
-        self.c.update(FractalPlane::C, &self.common, zcp);
-        self.p.update(FractalPlane::P, &self.common, zcp);
-        self.z.poll_fut(FractalPlane::Z, &self.common, zcp);
-        self.c.poll_fut(FractalPlane::C, &self.common, zcp);
-        self.p.poll_fut(FractalPlane::P, &self.common, zcp);
+        self.z
+            .update(FractalPlane::Z, &self.gl, &self.common, zcp, ctx);
+        self.c
+            .update(FractalPlane::C, &self.gl, &self.common, zcp, ctx);
+        self.p
+            .update(FractalPlane::P, &self.gl, &self.common, zcp, ctx);
+        self.z.poll_fut(self.gl.gl());
+        self.c.poll_fut(self.gl.gl());
+        self.p.poll_fut(self.gl.gl());
     }
-    fn show_plane(&mut self, param: FractalPlane, ctx: &egui::Context) {
-        let zcp = self.zcp();
+    fn show_plane(&mut self, param: FractalPlane, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::Window::new(param.plane()).show(ctx, |ui| {
             let (sel, others) = param.select([&mut self.z, &mut self.c, &mut self.p]);
-            if sel.show(param, &self.common, zcp, ui) {
+            if sel.show(param, ui, frame) {
                 for o in others {
                     o.mark_changed();
                 }
@@ -286,22 +256,23 @@ impl App {
     }
 }
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::Window::new("Editor")
             .default_size(egui::vec2(250.0, 250.0))
             .show(ctx, |ui| {
                 editor::show(self, ui);
             });
         egui::Window::new("Export").show(ctx, |ui| {
-            self.export.show(ui, self.zcp(), &self.common);
+            self.export.show(ui, self.zcp(), &self.common, &self.gl);
         });
-        self.update();
+        self.update(ctx);
         egui::Window::new("Params").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add(
                         egui::Slider::new(&mut self.common.exponent, -5.0..=5.0)
                             .max_decimals(if self.integer_exp { 0 } else { 2 })
+                            .clamping(egui::SliderClamping::Never)
                             .text("Exponent"),
                     )
                     .changed()
@@ -314,16 +285,26 @@ impl eframe::App for App {
             });
             if ui
                 .add(
-                    egui::Slider::new(&mut self.common.depth, 1..=1000)
+                    egui::Slider::new(&mut self.common.depth, 1..=10000)
                         .logarithmic(true)
+                        .clamping(egui::SliderClamping::Never)
                         .text("Depth"),
                 )
                 .changed()
             {
-                self.common.upper.regenerate(self.common.depth, false);
-                if let Some(lower) = &mut self.common.lower {
-                    lower.regenerate(self.common.depth, false);
-                }
+                self.z.mark_changed();
+                self.c.mark_changed();
+                self.p.mark_changed();
+            }
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.common.boundary, 0.0..=4.0)
+                        .max_decimals(2)
+                        .clamping(egui::SliderClamping::Never)
+                        .text("Boundary"),
+                )
+                .changed()
+            {
                 self.z.mark_changed();
                 self.c.mark_changed();
                 self.p.mark_changed();
@@ -332,9 +313,9 @@ impl eframe::App for App {
             show_param(ui, "c", &mut self.c, [&mut self.p, &mut self.z]);
             show_param(ui, "P", &mut self.p, [&mut self.z, &mut self.c]);
         });
-        self.show_plane(FractalPlane::Z, ctx);
-        self.show_plane(FractalPlane::C, ctx);
-        self.show_plane(FractalPlane::P, ctx);
+        self.show_plane(FractalPlane::Z, ctx, frame);
+        self.show_plane(FractalPlane::C, ctx, frame);
+        self.show_plane(FractalPlane::P, ctx, frame);
         egui::Window::new("Colors").show(ctx, |ui| {
             let renorm_box = ui.checkbox(&mut self.common.renorm, "Renormalize");
             if renorm_box.hovered() {
@@ -368,7 +349,7 @@ impl eframe::App for App {
                 self.common.lower = None;
             }
             if changed {
-                self.common.regenerate(true);
+                self.common.update_palettes();
                 self.z.mark_changed();
                 self.c.mark_changed();
                 self.p.mark_changed();
@@ -423,14 +404,19 @@ fn show_param(
 }
 
 fn main() {
-    eframe::run_native(
+    let res = eframe::run_native(
         "Fractal Explorer",
         eframe::NativeOptions {
             centered: true,
             viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1280.0, 900.0)),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
-    .unwrap();
+        Box::new(|cc| match App::new(cc) {
+            Ok(app) => Ok(Box::new(app)),
+            Err(err) => Err(err.into()),
+        }),
+    );
+    if let Err(err) = res {
+        eprintln!("{err}");
+    }
 }

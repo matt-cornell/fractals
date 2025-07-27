@@ -1,31 +1,52 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 
-const SPECIAL_BASE: usize = usize::MAX >> 2;
-const READY: usize = SPECIAL_BASE;
-const WAITING: usize = SPECIAL_BASE + 1;
-const CANCELLING: usize = SPECIAL_BASE >> 1;
+enum Progress {
+    Ready,
+    Rendering {
+        plane: FractalPlane,
+        zcp: [Complex32; 3],
+        res: i32,
+        x: i32,
+        y: i32,
+        common: CommonData,
+        frame: glow::Framebuffer,
+        texture: glow::Texture,
+    },
+    Waiting {
+        fut: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
+        res: usize,
+        frame: glow::Framebuffer,
+        texture: glow::Texture,
+    },
+}
 
 pub struct ExportState {
     export_sel: FractalPlane,
     export_size: usize,
-    export_state: Arc<AtomicUsize>,
-    export_res: Arc<Mutex<Result<(), String>>>,
+    export_res: Result<(), String>,
+    progress: Progress,
 }
 impl Default for ExportState {
     fn default() -> Self {
         Self {
             export_sel: FractalPlane::Z,
             export_size: 8192,
-            export_state: Arc::new(AtomicUsize::new(READY)),
-            export_res: Arc::new(Mutex::new(Ok(()))),
+            export_res: Ok(()),
+            progress: Progress::Ready,
         }
     }
 }
 impl ExportState {
-    pub fn show(&mut self, ui: &mut egui::Ui, zcp: [Complex64; 3], common: &CommonData) {
-        let state = self.export_state.load(Ordering::Acquire);
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        zcp: [Complex32; 3],
+        common: &CommonData,
+        gl: &gl::GlState,
+    ) {
         egui::ComboBox::new("Fractal Plane", "Fractal Plane")
             .selected_text(match self.export_sel {
                 FractalPlane::Z => "z",
@@ -38,117 +59,189 @@ impl ExportState {
                 ui.selectable_value(&mut self.export_sel, FractalPlane::P, "P");
             });
         ui.add_enabled(
-            state == READY,
+            matches!(self.progress, Progress::Ready),
             egui::Slider::new(&mut self.export_size, 0..=10000)
                 .clamping(egui::SliderClamping::Never)
                 .logarithmic(true),
         );
-
-        match state {
-            READY => {
+        self.export_size = self.export_size.min(i32::MAX as _);
+        match self.progress {
+            Progress::Ready => {
                 if ui.button("Export").clicked() {
-                    *self.export_res.lock().unwrap() = Ok(());
-                    let state = Arc::clone(&self.export_state);
-                    let common = common.clone();
-                    let res = Arc::clone(&self.export_res);
-                    let export_sel = self.export_sel;
-                    let export_size = self.export_size;
-                    std::thread::spawn(move || {
-                        state.store(0, Ordering::Release);
-                        let mut buffer = vec![Color32::PLACEHOLDER; export_size * export_size];
-                        let broke = plane::render_fractal(
-                            zcp,
-                            export_sel,
-                            None,
-                            export_size,
-                            &common,
-                            &mut buffer,
-                            Some(&|| state.fetch_add(1, Ordering::AcqRel) >= CANCELLING),
-                        );
-                        if broke {
-                            state.store(READY, Ordering::Release);
-                            return;
-                        }
-                        state.store(WAITING, Ordering::Release);
-                        let fut = rfd::AsyncFileDialog::new()
-                            .add_filter("Images", &["png"])
-                            .set_file_name("fractal.png")
-                            .save_file();
-                        let handle = pollster::block_on(fut);
-                        let Some(handle) = handle else {
-                            state.store(READY, Ordering::Release);
-                            return;
+                    self.export_res = Ok(());
+                    unsafe {
+                        let texture = match gl.texture(self.export_size) {
+                            Ok(tex) => tex,
+                            Err(err) => {
+                                self.export_res = Err(format!("Failed to create texture: {err}"));
+                                return;
+                            }
                         };
-
-                        'save: {
-                            let Ok(file) =
-                                std::fs::File::create(handle.path()).inspect_err(|err| {
-                                    *res.lock().unwrap() =
-                                        Err(format!("Failed to open file: {err}"))
-                                })
-                            else {
-                                break 'save;
-                            };
-                            let mut encoder =
-                                png::Encoder::new(file, export_size as _, export_size as _);
-                            encoder.set_color(png::ColorType::Rgba);
-                            let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
-                                *res.lock().unwrap() = Err(format!("Failed to save image: {err}"))
-                            }) else {
-                                break 'save;
-                            };
-                            if let Err(err) = writer.write_image_data(bytemuck::cast_slice(&buffer))
-                            {
-                                *res.lock().unwrap() = Err(format!("Failed to save image: {err}"));
-                                break 'save;
+                        let framebuffer = match gl.gl().create_framebuffer() {
+                            Ok(buf) => buf,
+                            Err(err) => {
+                                gl.gl().delete_texture(texture);
+                                self.export_res =
+                                    Err(format!("Failed to create framebuffer: {err}"));
+                                return;
                             }
-                            if let Err(err) = writer.finish() {
-                                *res.lock().unwrap() = Err(format!("Failed to save image: {err}"));
-                                break 'save;
-                            }
-                        }
-
-                        state.store(READY, Ordering::Release);
-                    });
+                        };
+                        self.export_res = gl.attach_texture(texture, framebuffer, true);
+                        self.progress = Progress::Rendering {
+                            plane: self.export_sel,
+                            zcp,
+                            res: self.export_size as _,
+                            x: 0,
+                            y: 0,
+                            common: common.clone(),
+                            frame: framebuffer,
+                            texture,
+                        };
+                    }
                 }
             }
-            WAITING => {
-                ui.horizontal(|ui| {
-                    ui.label("Ready to save");
-                    if ui.button("Cancel").clicked() {
-                        self.export_state.store(CANCELLING, Ordering::Release);
-                    }
-                });
-            }
-            CANCELLING..SPECIAL_BASE => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Cancelling...");
-                });
-            }
-            step => {
-                let progress = step as f32 / (self.export_size * self.export_size) as f32;
+            Progress::Rendering {
+                plane,
+                zcp,
+                res,
+                ref mut x,
+                ref mut y,
+                ref common,
+                frame,
+                texture,
+            } => {
+                let num_rows = (res as usize).div_ceil(512);
+                let progress = ((*y / 512) as usize * num_rows + (*x / 512) as usize) as f32
+                    / (num_rows * num_rows) as f32;
+                let mut cancel = false;
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!(
-                        "Processing {}/{} ({:.1}%)",
-                        step,
-                        self.export_size * self.export_size,
-                        progress * 100.0
-                    ));
+                    ui.label(format!("Processing {:.1}%", progress * 100.0));
                     if ui.button("Cancel").clicked() {
-                        self.export_state.store(CANCELLING, Ordering::Release);
+                        cancel = true;
                     }
                 });
                 ui.add(egui::ProgressBar::new(progress));
+                if cancel {
+                    unsafe {
+                        gl.gl().delete_framebuffer(frame);
+                        gl.gl().delete_texture(texture);
+                    }
+                    self.progress = Progress::Ready;
+                    return;
+                }
+                gl.render(
+                    common,
+                    frame,
+                    zcp,
+                    plane,
+                    [*x, *y, (res - *x).min(512), (res - *y).min(512)],
+                    res as _,
+                );
+                *x += 512;
+                if *x >= res {
+                    *x = 0;
+                    *y += 512;
+                }
+                if *y >= res {
+                    let fut = rfd::AsyncFileDialog::new()
+                        .add_filter("Images", &["png"])
+                        .set_file_name("fractal.png")
+                        .save_file();
+                    self.progress = Progress::Waiting {
+                        fut: Box::pin(fut),
+                        res: res as _,
+                        frame,
+                        texture,
+                    };
+                }
+            }
+            Progress::Waiting {
+                ref mut fut,
+                res,
+                frame,
+                texture,
+            } => {
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    ui.label("Ready to save");
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if cancel {
+                    self.progress = Progress::Ready;
+                    unsafe {
+                        gl.gl().delete_framebuffer(frame);
+                        gl.gl().delete_texture(texture);
+                    }
+                    return;
+                }
+                let waker = Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                let Poll::Ready(handle) = fut.as_mut().poll(&mut cx) else {
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    return;
+                };
+                let Some(handle) = handle else {
+                    self.progress = Progress::Ready;
+                    unsafe {
+                        gl.gl().delete_framebuffer(frame);
+                    }
+                    return;
+                };
+
+                'save: {
+                    let Ok(file) = std::fs::File::create(handle.path()).inspect_err(|err| {
+                        self.export_res = Err(format!("Failed to open file: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    let mut encoder = png::Encoder::new(file, res as _, res as _);
+                    encoder.set_color(png::ColorType::Rgba);
+                    let Ok(mut writer) = encoder.write_header().inspect_err(|err| {
+                        self.export_res = Err(format!("Failed to save image: {err}"))
+                    }) else {
+                        break 'save;
+                    };
+                    let mut buffer = vec![0; res * res * 4];
+                    unsafe {
+                        let gl = gl.gl();
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame));
+                        gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                        gl.read_pixels(
+                            0,
+                            0,
+                            res as _,
+                            res as _,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut buffer)),
+                        );
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    }
+                    if let Err(err) = writer.write_image_data(&buffer) {
+                        self.export_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                    if let Err(err) = writer.finish() {
+                        self.export_res = Err(format!("Failed to save image: {err}"));
+                        break 'save;
+                    }
+                }
+
+                self.progress = Progress::Ready;
+                unsafe {
+                    gl.gl().delete_framebuffer(frame);
+                    gl.gl().delete_texture(texture);
+                }
             }
         }
-        let mut guard = self.export_res.lock().unwrap();
-        if let Err(err) = &*guard {
+        if let Err(err) = &self.export_res {
             let mut clicked = false;
             add_error(err, ui, Some(&mut || clicked = true));
             if clicked {
-                *guard = Ok(());
+                self.export_res = Ok(());
             }
         }
     }

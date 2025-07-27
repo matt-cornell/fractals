@@ -1095,7 +1095,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "eframe",
+ "egui",
+ "egui_glow",
  "futures-lite",
+ "glow",
  "num-complex",
  "num-integer",
  "png",

@@ -27,6 +27,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if app.z.changed() || app.c.changed() || app.p.changed() {
         let res = serde_json::to_string_pretty(&AppState {
             exponent: app.common.exponent,
+            boundary: app.common.boundary,
             depth: app.common.depth,
             renorm: app.common.renorm,
             z: app.z.param_str.clone(),
@@ -100,6 +101,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 if app.common.exponent % 1.0 != 0.0 {
                     app.integer_exp = false;
                 }
+                app.common.boundary = state.boundary;
                 app.common.depth = state.depth;
                 app.common.renorm = state.renorm;
                 app.z.param_str = state.z;
@@ -111,7 +113,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.z.mark_changed();
                 app.c.mark_changed();
                 app.p.mark_changed();
-                let sort = state.palette.is_some();
                 if let Some(p) = state.palette {
                     match p {
                         PaletteSerde::Single { palette } => {
@@ -126,14 +127,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 edit: Vec::new(),
                                 stops: Vec::new(),
                                 exponential: false,
-                                palette: Vec::new(),
                             });
                             lower_palette.exponential = lower.exponential;
                             lower_palette.edit = lower.stops;
                         }
                     }
+                    app.common.update_palettes();
                 }
-                app.common.regenerate(sort);
             }
             Err(err) => app.edit.edit_res = Err(err.to_string()),
         }
@@ -339,9 +339,16 @@ enum PaletteSerde {
     },
 }
 
+const fn two() -> f32 {
+    2.0
+}
+
 #[derive(Serialize, Deserialize)]
 struct AppState {
-    exponent: f64,
+    #[serde(default = "two")]
+    exponent: f32,
+    #[serde(default = "two")]
+    boundary: f32,
     depth: usize,
     #[serde(default)]
     renorm: bool,
