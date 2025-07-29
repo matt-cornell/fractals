@@ -1,3 +1,5 @@
+use egui::epaint::Hsva;
+
 use super::*;
 use std::fmt::Write;
 use std::future::Future;
@@ -229,16 +231,38 @@ impl ImageData {
                 ((self.param.re + 2.0) / scale) as usize,
                 ((-self.param.im + 2.0) / scale) as usize,
             );
+            let mut px = Color32::PLACEHOLDER;
+            unsafe {
+                let gl = frame.gl().unwrap();
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+                gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                gl.read_pixels(
+                    tx as _,
+                    ty as _,
+                    1,
+                    1,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(bytemuck::bytes_of_mut(&mut px))),
+                );
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            }
+            let mut hsv = Hsva::from(px);
+            hsv.s = 1.0;
+            hsv.h += 0.5;
+            hsv.h %= 1.0;
+            hsv.v = (1.0 - hsv.v).max(0.5);
+            let color = Color32::from(hsv);
             let painter = ui.painter_at(img.rect);
             painter.vline(
                 tx as f32 + img.rect.min.x,
                 (ty as f32 - 5.0 + img.rect.min.y)..=(ty as f32 + 5.0 + img.rect.min.y),
-                (1.0, Color32::RED),
+                (1.0, color),
             );
             painter.hline(
                 (tx as f32 - 5.0 + img.rect.min.x)..=(tx as f32 + 5.0 + img.rect.min.x),
                 ty as f32 + img.rect.min.y,
-                (1.0, Color32::RED),
+                (1.0, color),
             );
         }
         img.context_menu(|ui| {
@@ -327,12 +351,19 @@ fn add_marker(target: Complex32, resolution: usize, buffer: &mut Vec<Color32>) {
         ((target.re + 2.0) / scale) as usize,
         ((-target.im + 2.0) / scale) as usize,
     );
+    let px = buffer[ty * resolution + tx];
+    let mut hsv = Hsva::from(px);
+    hsv.s = 1.0;
+    hsv.h += 0.5;
+    hsv.h %= 1.0;
+    hsv.v = (1.0 - hsv.v).max(0.5);
+    let color = Color32::from(hsv);
     let xmin = tx.saturating_sub(5);
     let xmax = tx.saturating_add(5).min(resolution - 1);
     let ymin = ty.saturating_sub(5);
     let ymax = ty.saturating_add(5).min(resolution - 1);
-    buffer[(ty * resolution + xmin)..=(ty * resolution + xmax)].fill(Color32::RED);
+    buffer[(ty * resolution + xmin)..=(ty * resolution + xmax)].fill(color);
     for y in ymin..=ymax {
-        buffer[y * resolution + tx] = Color32::RED;
+        buffer[y * resolution + tx] = color;
     }
 }
