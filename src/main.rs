@@ -327,6 +327,13 @@ impl eframe::App for App {
             if split_grad_box.hovered() {
                 split_grad_box.show_tooltip_text("Use a linear blend of upper and lower gradients rather than just one");
             }
+            #[allow(clippy::collapsible_if)]
+            if show_lower {
+                if ui.button("Swap Gradients").clicked() {
+                    let lower = self.common.lower.get_or_insert_with(|| self.common.upper.clone());
+                    std::mem::swap(&mut self.common.upper, lower);
+                }
+            }
             changed |= split_grad_box.changed();
             changed |= egui::CollapsingHeader::new(if self.common.lower.is_some() {
                 "Upper"
